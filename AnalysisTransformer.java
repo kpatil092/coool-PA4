@@ -9,32 +9,36 @@ import java.util.*;
 /**
  * Monomorphization transformation using the Soot framework.
  *
- * <p>Algorithm overview:
+ * <p>
+ * Algorithm overview:
  * <ol>
- *   <li>Build / retrieve the Soot call graph (SPARK + VTA/CHA combination).</li>
- *   <li>Iterate over every reachable method and every invoke statement inside it.</li>
- *   <li>For each virtual / interface call site that has EXACTLY ONE target in the
- *       call graph, create a fresh static method whose signature mirrors the
- *       original but receives the receiver as an explicit first parameter.</li>
- *   <li>Replace the virtual invoke expression with a static invoke that passes
- *       the old receiver as the new first argument.</li>
- *   <li>Reuse already-created static stubs (keyed by original method + declaring
- *       class) so we do not duplicate work when the same target is reached from
- *       multiple call sites.</li>
+ * <li>Build / retrieve the Soot call graph (SPARK + VTA/CHA combination).</li>
+ * <li>Iterate over every reachable method and every invoke statement inside
+ * it.</li>
+ * <li>For each virtual / interface call site that has EXACTLY ONE target in the
+ * call graph, create a fresh static method whose signature mirrors the
+ * original but receives the receiver as an explicit first parameter.</li>
+ * <li>Replace the virtual invoke expression with a static invoke that passes
+ * the old receiver as the new first argument.</li>
+ * <li>Reuse already-created static stubs (keyed by original method + declaring
+ * class) so we do not duplicate work when the same target is reached from
+ * multiple call sites.</li>
  * </ol>
  *
- * <p>Edge cases handled:
+ * <p>
+ * Edge cases handled:
  * <ul>
- *   <li>Interface invokes ({@link InterfaceInvokeExpr}) as well as virtual invokes
- *       ({@link VirtualInvokeExpr}) and special invokes ({@link SpecialInvokeExpr})
- *       are all considered.</li>
- *   <li>Methods that belong to excluded / phantom classes are skipped.</li>
- *   <li>Native methods cannot have a Jimple body and are skipped.</li>
- *   <li>Recursive targets (callee == caller) are handled safely because the stub
- *       is inserted into the scene before the body is mutated.</li>
- *   <li>Methods that are already static are not processed.</li>
- *   <li>The receiver cast is inserted when the declared parameter type differs
- *       from the concrete receiver type to keep Jimple type-correctness.</li>
+ * <li>Interface invokes ({@link InterfaceInvokeExpr}) as well as virtual
+ * invokes
+ * ({@link VirtualInvokeExpr}) and special invokes ({@link SpecialInvokeExpr})
+ * are all considered.</li>
+ * <li>Methods that belong to excluded / phantom classes are skipped.</li>
+ * <li>Native methods cannot have a Jimple body and are skipped.</li>
+ * <li>Recursive targets (callee == caller) are handled safely because the stub
+ * is inserted into the scene before the body is mutated.</li>
+ * <li>Methods that are already static are not processed.</li>
+ * <li>The receiver cast is inserted when the declared parameter type differs
+ * from the concrete receiver type to keep Jimple type-correctness.</li>
  * </ul>
  */
 public class AnalysisTransformer extends SceneTransformer {
@@ -48,40 +52,55 @@ public class AnalysisTransformer extends SceneTransformer {
 
     @Override
     protected void internalTransform(String phaseName, Map<String, String> options) {
+
         CallGraph cg = Scene.v().getCallGraph();
 
-        // Collect application classes to avoid ConcurrentModificationException
-        // while we add new synthetic classes to the scene.
-        List<SootClass> appClasses = new ArrayList<>(Scene.v().getApplicationClasses());
+        LinkedList<SootMethod> worklist = new LinkedList<>();
 
-        for (SootClass sc : appClasses) {
-            if (sc.isPhantom() || !sc.isConcrete()) {
+        // initialize worklist
+        for (SootClass sc : Scene.v().getApplicationClasses()) {
+            if (sc.isPhantom() || !sc.isConcrete())
                 continue;
-            }
 
-            // Snapshot the method list; we will add stubs to OTHER classes,
-            // but iterating the original list is still safer.
-            List<SootMethod> methods = new ArrayList<>(sc.getMethods());
-
-            for (SootMethod method : methods) {
-                if (method.isStatic()
-                        || method.isNative()
-                        || method.isAbstract()
-                        || !method.isConcrete()) {
+            for (SootMethod m : sc.getMethods()) {
+                if (!m.isConcrete() || m.isAbstract() || m.isNative())
                     continue;
-                }
 
-                if (!method.hasActiveBody()) {
+                if (!m.hasActiveBody()) {
                     try {
-                        method.retrieveActiveBody();
+                        m.retrieveActiveBody();
                     } catch (Exception e) {
-                        // Body cannot be retrieved (e.g., phantom refs) – skip.
                         continue;
                     }
                 }
 
-                Body body = method.getActiveBody();
-                transformBody(body, cg);
+                worklist.add(m);
+            }
+        }
+
+        Set<SootMethod> seen = new HashSet<>();
+
+        while (!worklist.isEmpty()) {
+            SootMethod m = worklist.poll();
+
+            if (!m.hasActiveBody())
+                continue;
+
+            Body body = m.getActiveBody();
+
+            boolean changed = transformBody(body, cg);
+
+            if (changed) {
+                // 🔥 reprocess this method again
+                worklist.add(m);
+
+                // also add all stub methods (important!)
+                for (SootMethod stub : staticStubCache.values()) {
+                    if (!seen.contains(stub)) {
+                        worklist.add(stub);
+                        seen.add(stub);
+                    }
+                }
             }
         }
 
@@ -96,9 +115,11 @@ public class AnalysisTransformer extends SceneTransformer {
      * Scans every statement in {@code body} for mono-morphic virtual/interface
      * call sites and replaces them with calls to the corresponding static stub.
      */
-    private void transformBody(Body body, CallGraph cg) {
+    private boolean transformBody(Body body, CallGraph cg) {
         SootMethod enclosingMethod = body.getMethod();
         Chain<Unit> units = body.getUnits();
+
+        boolean changed = false;
 
         // Snapshot: avoid ConcurrentModificationException while patching.
         List<Unit> unitSnapshot = new ArrayList<>(units);
@@ -113,8 +134,7 @@ public class AnalysisTransformer extends SceneTransformer {
 
             // Only virtual / interface / special instance calls are candidates.
             if (!(invokeExpr instanceof VirtualInvokeExpr)
-                    && !(invokeExpr instanceof InterfaceInvokeExpr)
-                    && !(invokeExpr instanceof SpecialInvokeExpr)) {
+                    && !(invokeExpr instanceof InterfaceInvokeExpr)) {
                 continue;
             }
 
@@ -124,11 +144,33 @@ public class AnalysisTransformer extends SceneTransformer {
             // 1. Check call graph: how many targets does this call site have?
             // ------------------------------------------------------------------
             Iterator<Edge> edgesOut = cg.edgesOutOf(stmt);
-            SootMethod singleTarget = getSingleTarget(edgesOut);
+
+            // IMPORTANT: we must re-iterate, so store edges
+
+            // System.out.println("Callsite: " + stmt);
+            Iterator<Edge> it = cg.edgesOutOf(stmt);
+            // while (it.hasNext()) {
+            //     System.out.println("  -> " + it.next().getTgt().method());
+            // }
+
+            List<Edge> edgeList = new ArrayList<>();
+            while (edgesOut.hasNext()) {
+                edgeList.add(edgesOut.next());
+            }
+            SootMethod singleTarget = getSingleTarget(edgeList.iterator());
 
             if (singleTarget == null) {
-                // Zero or multiple targets → not mono-morphic, skip.
-                continue;
+                if (!edgeList.isEmpty()) {
+                    // multiple distinct targets → skip
+                    continue;
+                }
+
+                // ✔ fallback only when NO edges
+                try {
+                    singleTarget = iie.getMethod();
+                } catch (Exception e) {
+                    continue;
+                }
             }
 
             // Skip if target is native, abstract, or belongs to a phantom class.
@@ -153,8 +195,8 @@ public class AnalysisTransformer extends SceneTransformer {
 
             // ------------------------------------------------------------------
             // 3. Build the replacement static invoke expression.
-            //    Original args: [arg0, arg1, ...]
-            //    New args:      [receiver, arg0, arg1, ...]
+            // Original args: [arg0, arg1, ...]
+            // New args: [receiver, arg0, arg1, ...]
             // ------------------------------------------------------------------
             List<Value> newArgs = new ArrayList<>();
             Value receiver = iie.getBase();
@@ -167,8 +209,7 @@ public class AnalysisTransformer extends SceneTransformer {
             newArgs.add(receiverArg);
             newArgs.addAll(invokeExpr.getArgs());
 
-            StaticInvokeExpr staticInvoke =
-                    Jimple.v().newStaticInvokeExpr(stub.makeRef(), newArgs);
+            StaticInvokeExpr staticInvoke = Jimple.v().newStaticInvokeExpr(stub.makeRef(), newArgs);
 
             // ------------------------------------------------------------------
             // 4. Patch the statement in-place.
@@ -180,7 +221,11 @@ public class AnalysisTransformer extends SceneTransformer {
             }
             // Other statement kinds (e.g., ThrowStmt) don't carry invoke exprs
             // in the way that would reach here.
+
+            changed = true;
         }
+
+        return changed;
     }
 
     // -------------------------------------------------------------------------
@@ -214,7 +259,8 @@ public class AnalysisTransformer extends SceneTransformer {
      * Returns a cached static stub for {@code original}, or creates, registers,
      * and populates one if it does not yet exist.
      *
-     * <p>The stub has the same name as the original, prefixed with
+     * <p>
+     * The stub has the same name as the original, prefixed with
      * {@code "__mono_"}, resides in the same class, and carries an extra first
      * parameter of the declaring class type (the explicit receiver).
      */
@@ -276,13 +322,14 @@ public class AnalysisTransformer extends SceneTransformer {
     /**
      * Populates {@code stub} with a Jimple body that:
      * <ol>
-     *   <li>Receives the receiver as {@code @parameter 0} (type = declaring class).</li>
-     *   <li>Receives the original parameters as {@code @parameter 1..n}.</li>
-     *   <li>Reads the original method's body.</li>
-     *   <li>Replaces every occurrence of {@code @this} with the explicit receiver
-     *       parameter, and every {@code @parameter i} with {@code @parameter i+1}.</li>
-     *   <li>Clones all locals, traps, and units from the original body into the
-     *       stub body, applying the parameter remapping.</li>
+     * <li>Receives the receiver as {@code @parameter 0} (type = declaring
+     * class).</li>
+     * <li>Receives the original parameters as {@code @parameter 1..n}.</li>
+     * <li>Reads the original method's body.</li>
+     * <li>Replaces every occurrence of {@code @this} with the explicit receiver
+     * parameter, and every {@code @parameter i} with {@code @parameter i+1}.</li>
+     * <li>Clones all locals, traps, and units from the original body into the
+     * stub body, applying the parameter remapping.</li>
      * </ol>
      */
     private void buildStubBody(SootMethod stub, SootMethod original) {
@@ -361,23 +408,28 @@ public class AnalysisTransformer extends SceneTransformer {
         // After cloning, the cloned body still contains IdentityStmt with
         // ThisRef / ParameterRef pointing to the original method's indices.
         // We need to:
-        //   - Replace @this    → @parameter 0 (receiverLocal) in the stub.
-        //   - Replace @param i → @parameter i+1 in the stub.
-        //   - Replace all Value uses of origThisLocal → receiverLocal.
-        //   - Replace all Value uses of other original locals → their stub clones.
+        // - Replace @this → @parameter 0 (receiverLocal) in the stub.
+        // - Replace @param i → @parameter i+1 in the stub.
+        // - Replace all Value uses of origThisLocal → receiverLocal.
+        // - Replace all Value uses of other original locals → their stub clones.
 
-        for (Unit unit : stubBody.getUnits()) {
+        Unit clonedThisIdentityUnit = null;
+        ArrayList<Unit> unitList = new ArrayList<>(stubBody.getUnits());
+
+        for (Unit unit : unitList) {
             Stmt stmt = (Stmt) unit;
 
-            // Fix IdentityStmt (e.g.  r0 := @this, x := @parameter 0)
+            // Fix IdentityStmt (e.g. r0 := @this, x := @parameter 0)
             if (stmt instanceof IdentityStmt) {
                 IdentityStmt idStmt = (IdentityStmt) stmt;
                 Value rightOp = idStmt.getRightOp();
 
                 if (rightOp instanceof ThisRef) {
                     // Replace with: receiverLocal := @parameter 0
-                    idStmt.setRightOp(Jimple.v().newParameterRef(
-                            stub.getParameterType(0), 0));
+                    // idStmt.setRightOp(Jimple.v().newParameterRef(stub.getParameterType(0), 0));
+
+                    clonedThisIdentityUnit = unit;
+
                     // The left-hand side local was cloned from origThisLocal;
                     // update localMap so further uses are replaced correctly.
                     // Actually we handle this via the general local-replacement pass below.
@@ -406,11 +458,16 @@ public class AnalysisTransformer extends SceneTransformer {
             }
         }
 
+        if (clonedThisIdentityUnit != null) {
+            stubBody.getUnits().remove(clonedThisIdentityUnit);
+        }
+
         // Wire up the receiver identity statement at the top.
         // The cloned @this identity stmt now sets a cloned local to @parameter 0,
-        // but we want receiverLocal to carry the receiver.  Insert a fresh
+        // but we want receiverLocal to carry the receiver. Insert a fresh
         // identity statement for receiverLocal BEFORE all others and remove the
         // clone of the original @this identity.
+
         IdentityStmt receiverIdStmt = Jimple.v().newIdentityStmt(
                 receiverLocal,
                 Jimple.v().newParameterRef(stub.getParameterType(0), 0));
@@ -467,7 +524,7 @@ public class AnalysisTransformer extends SceneTransformer {
 
     /**
      * If {@code value}'s type already conforms to {@code targetType}, returns
-     * {@code value} unchanged.  Otherwise inserts a cast statement before
+     * {@code value} unchanged. Otherwise inserts a cast statement before
      * {@code insertBefore} and returns a new typed local holding the cast result.
      */
     private Value ensureType(Value value, Type targetType, Stmt insertBefore, Body body) {
