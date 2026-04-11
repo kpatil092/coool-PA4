@@ -1,226 +1,230 @@
 import soot.*;
 import soot.jimple.*;
-import soot.jimple.toolkits.callgraph.CallGraph;
-import soot.jimple.toolkits.callgraph.Edge;
 import soot.util.Chain;
 
 import java.util.*;
 
 /**
- * Monomorphization transformation using the Soot framework.
+ * <h2>Devirtualization oracles — precision contract</h2>
  *
- * <p>
- * Algorithm overview:
+ * The transformer uses two oracles, each applicable in a different context:
+ *
+ * <dl>
+ * <dt>Oracle 1 — PTA ({@link #ptaSingleTarget})</dt>
+ * <dd>Used for every <em>original</em> application method reachable by PTA.
+ * Merges the set of concrete callees across every calling context and
+ * returns the unique one (or {@code null} if polymorphic). Never
+ * produces false monomorphism because it is backed by flow-sensitive
+ * heap information.</dd>
+ *
+ * <dt>Oracle 2 — Exact-local static dispatch
+ * ({@link #exactLocalSingleTarget})</dt>
+ * <dd>Used <em>exclusively</em> inside <em>stub bodies</em>, and only on
+ * locals that are provably exact-typed:
  * <ol>
- * <li>Build / retrieve the Soot call graph (SPARK + VTA/CHA combination).</li>
- * <li>Iterate over every reachable method and every invoke statement inside
- * it.</li>
- * <li>For each virtual / interface call site that has EXACTLY ONE target in the
- * call graph, create a fresh static method whose signature mirrors the
- * original but receives the receiver as an explicit first parameter.</li>
- * <li>Replace the virtual invoke expression with a static invoke that passes
- * the old receiver as the new first argument.</li>
- * <li>Reuse already-created static stubs (keyed by original method + declaring
- * class) so we do not duplicate work when the same target is reached from
- * multiple call sites.</li>
+ * <li>The stub's own explicit receiver local ({@code r0_explicit}).
+ * The stub was created only because PTA proved a single concrete
+ * type reached the original call site, so {@code r0_explicit}'s
+ * declared type IS that exact runtime type.</li>
+ * <li>Locals whose declared type is a {@code final} class — no
+ * subclass can exist, so the declared type IS the runtime type.</li>
  * </ol>
  *
- * <p>
- * Edge cases handled:
- * <ul>
- * <li>Interface invokes ({@link InterfaceInvokeExpr}) as well as virtual
- * invokes
- * ({@link VirtualInvokeExpr}) and special invokes ({@link SpecialInvokeExpr})
- * are all considered.</li>
- * <li>Methods that belong to excluded / phantom classes are skipped.</li>
- * <li>Native methods cannot have a Jimple body and are skipped.</li>
- * <li>Recursive targets (callee == caller) are handled safely because the stub
- * is inserted into the scene before the body is mutated.</li>
- * <li>Methods that are already static are not processed.</li>
- * <li>The receiver cast is inserted when the declared parameter type differs
- * from the concrete receiver type to keep Jimple type-correctness.</li>
- * </ul>
+ * <h2>Recursion safety</h2>
+ * Stubs are inserted into {@link #staticStubCache} <em>before</em> their
+ * bodies are built. A recursive virtual call resolves to the same stub via
+ * cache hit; no infinite loop occurs.
+ *
+ * <h2>Stub-chain depth</h2>
+ * {@link #transformStubBody} loops to convergence so chains of arbitrary
+ * depth are fully devirtualized.
  */
 public class AnalysisTransformer extends SceneTransformer {
 
+    // =========================================================================
+    // Configuration
+    // =========================================================================
+
+    /** Object-sensitivity depth for PTA (0 = context-insensitive). */
+    private final int ptaK;
+
+    public AnalysisTransformer() {
+        this(2);
+    }
+
+    public AnalysisTransformer(int k) {
+        this.ptaK = k;
+    }
+
+    // =========================================================================
+    // State
+    // =========================================================================
+
     /**
-     * Cache: (original SootMethod, declaring SootClass) -> generated static stub.
-     * This lets us reuse the same stub when multiple call sites share the same
-     * single-target callee.
+     * Cache: original SootMethod → generated static stub.
+     * Populated before the stub body is built to handle recursive methods.
      */
     private final Map<SootMethod, SootMethod> staticStubCache = new HashMap<>();
+
+    /**
+     * Reverse map: stub → original.
+     * Kept for introspection and downstream passes.
+     */
+    private final Map<SootMethod, SootMethod> stubToOriginal = new HashMap<>();
+
+    /**
+     * Per-stub "exact receiver local": the local whose declared type is the
+     * exact concrete type that PTA proved. Oracle 2 fires ONLY when the
+     * virtual-call base is this local (or a final-typed local).
+     *
+     * Key: stub SootMethod. Value: the {@code r0_explicit} Local in that stub.
+     */
+    private final Map<SootMethod, Local> stubReceiverLocal = new HashMap<>();
+
+    /** PTA instance — valid after {@link #internalTransform}. */
+    private ObjectSensitivePTA pta;
+
+    // =========================================================================
+    // Entry point
+    // =========================================================================
 
     @Override
     protected void internalTransform(String phaseName, Map<String, String> options) {
 
-        CallGraph cg = Scene.v().getCallGraph();
+        // ------------------------------------------------------------------
+        // Phase 1 — Run Object-Sensitive PTA
+        // ------------------------------------------------------------------
+        pta = new ObjectSensitivePTA(ptaK);
 
-        LinkedList<SootMethod> worklist = new LinkedList<>();
+        List<SootMethod> entryPoints = new ArrayList<>();
 
-        // initialize worklist
-        for (SootClass sc : Scene.v().getApplicationClasses()) {
-            if (sc.isPhantom() || !sc.isConcrete())
+        for (SootMethod m : Scene.v().getEntryPoints()) {
+            if (!m.getDeclaringClass().isApplicationClass())
+                continue;
+            if (!m.isConcrete())
                 continue;
 
-            for (SootMethod m : sc.getMethods()) {
-                if (!m.isConcrete() || m.isAbstract() || m.isNative())
-                    continue;
-
-                if (!m.hasActiveBody()) {
-                    try {
-                        m.retrieveActiveBody();
-                    } catch (Exception e) {
-                        continue;
-                    }
-                }
-
-                worklist.add(m);
-            }
+            entryPoints.add(m);
         }
 
-        Set<SootMethod> seen = new HashSet<>();
+        pta.run(entryPoints);
+        System.out.println("[Mono/PTA] PTA finished. Reachable context-methods: "
+                + pta.reachable.size());
+
+        pta.printCallGraph();
+        // ------------------------------------------------------------------
+        // Phase 2 — Devirtualize PTA-reachable original methods
+        //
+        // Stubs are devirtualized eagerly inside getOrCreateStaticStub (via
+        // transformStubBody with Oracle 2), so they do NOT go on this
+        // worklist. The worklist only drives original application methods.
+        // ------------------------------------------------------------------
+        Set<SootMethod> onWorklist = new LinkedHashSet<>();
+        Deque<SootMethod> worklist = new ArrayDeque<>();
+
+        for (ObjectSensitivePTA.ContextMethod cm : pta.reachable.keySet()) {
+            // System.out.println(cm.method.getSignature() + " : " + cm.context.toString()
+            // );
+            SootMethod base = cm.method;
+            if (base.isConcrete() && !base.isNative()
+                    && base.hasActiveBody() && onWorklist.add(base)) {
+                worklist.add(base);
+            }
+        }
 
         while (!worklist.isEmpty()) {
             SootMethod m = worklist.poll();
-
+            onWorklist.remove(m);
             if (!m.hasActiveBody())
                 continue;
 
-            Body body = m.getActiveBody();
-
-            boolean changed = transformBody(body, cg);
-
-            if (changed) {
-                // 🔥 reprocess this method again
+            // Oracle 1: PTA-backed devirtualization.
+            boolean changed = transformBody(m.getActiveBody(),
+                    null /* not a stub */);
+            if (changed && onWorklist.add(m))
                 worklist.add(m);
-
-                // also add all stub methods (important!)
-                for (SootMethod stub : staticStubCache.values()) {
-                    if (!seen.contains(stub)) {
-                        worklist.add(stub);
-                        seen.add(stub);
-                    }
-                }
-            }
         }
 
-        System.out.println("[Monomorphization] Static stubs created: " + staticStubCache.size());
+        System.out.println("[Mono/PTA] Static stubs created: "
+                + staticStubCache.size());
     }
 
-    // -------------------------------------------------------------------------
-    // Core per-body transformation
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // Per-body transformation
+    // =========================================================================
 
     /**
-     * Scans every statement in {@code body} for mono-morphic virtual/interface
-     * call sites and replaces them with calls to the corresponding static stub.
+     * Walks every virtual/interface call site in {@code body} and rewrites
+     * monomorphic ones as static-stub calls.
+     *
+     * @param body          the Jimple body to transform
+     * @param exactReceiver {@code null} → use Oracle 1 (PTA, for original
+     *                      methods). Non-null → use Oracle 2 (exact-local
+     *                      static dispatch, for stub bodies); the value is
+     *                      the stub's own {@code r0_explicit} local.
+     * @return {@code true} if at least one rewrite occurred
      */
-    private boolean transformBody(Body body, CallGraph cg) {
-        SootMethod enclosingMethod = body.getMethod();
-        Chain<Unit> units = body.getUnits();
-
+    private boolean transformBody(Body body, Local exactReceiver) {
+        SootMethod enclosing = body.getMethod();
         boolean changed = false;
 
-        // Snapshot: avoid ConcurrentModificationException while patching.
-        List<Unit> unitSnapshot = new ArrayList<>(units);
+        List<Unit> snapshot = new ArrayList<>(body.getUnits());
 
-        for (Unit unit : unitSnapshot) {
+        for (Unit unit : snapshot) {
             Stmt stmt = (Stmt) unit;
-            if (!stmt.containsInvokeExpr()) {
+            if (!stmt.containsInvokeExpr())
                 continue;
-            }
 
-            InvokeExpr invokeExpr = stmt.getInvokeExpr();
-
-            // Only virtual / interface / special instance calls are candidates.
-            if (!(invokeExpr instanceof VirtualInvokeExpr)
-                    && !(invokeExpr instanceof InterfaceInvokeExpr)) {
+            InvokeExpr ie = stmt.getInvokeExpr();
+            if (!(ie instanceof VirtualInvokeExpr)
+                    && !(ie instanceof InterfaceInvokeExpr))
                 continue;
-            }
 
-            InstanceInvokeExpr iie = (InstanceInvokeExpr) invokeExpr;
+            InstanceInvokeExpr iie = (InstanceInvokeExpr) ie;
 
             // ------------------------------------------------------------------
-            // 1. Check call graph: how many targets does this call site have?
+            // Select oracle.
             // ------------------------------------------------------------------
-            Iterator<Edge> edgesOut = cg.edgesOutOf(stmt);
+            SootMethod singleTarget = (exactReceiver == null)
+                    ? ptaSingleTarget(enclosing, stmt) // Oracle 1
+                    : exactLocalSingleTarget(iie, exactReceiver); // Oracle 2
 
-            // IMPORTANT: we must re-iterate, so store edges
+            if (singleTarget == null)
+                continue;
 
-            // System.out.println("Callsite: " + stmt);
-            Iterator<Edge> it = cg.edgesOutOf(stmt);
-            // while (it.hasNext()) {
-            //     System.out.println("  -> " + it.next().getTgt().method());
-            // }
-
-            List<Edge> edgeList = new ArrayList<>();
-            while (edgesOut.hasNext()) {
-                edgeList.add(edgesOut.next());
-            }
-            SootMethod singleTarget = getSingleTarget(edgeList.iterator());
-
-            if (singleTarget == null) {
-                if (!edgeList.isEmpty()) {
-                    // multiple distinct targets → skip
-                    continue;
-                }
-
-                // ✔ fallback only when NO edges
-                try {
-                    singleTarget = iie.getMethod();
-                } catch (Exception e) {
-                    continue;
-                }
-            }
-
-            // Skip if target is native, abstract, or belongs to a phantom class.
+            // Guard against un-stubbable targets.
             if (singleTarget.isNative()
                     || singleTarget.isAbstract()
-                    || singleTarget.getDeclaringClass().isPhantom()) {
+                    || singleTarget.getDeclaringClass().isPhantom()
+                    || singleTarget.isStatic())
                 continue;
-            }
 
-            // Skip if it is already a static method (shouldn't happen via iie, but
-            // defensive check).
-            if (singleTarget.isStatic()) {
+            if (!singleTarget.hasActiveBody()
+                    || singleTarget.getDeclaringClass().isJavaLibraryClass())
                 continue;
-            }
-
-            // Self-recursion via the same virtual dispatch — safe, continue.
 
             // ------------------------------------------------------------------
-            // 2. Get or create the static stub for this target.
+            // Get or create the static stub (cache-before-build → recursion safe).
             // ------------------------------------------------------------------
             SootMethod stub = getOrCreateStaticStub(singleTarget);
 
             // ------------------------------------------------------------------
-            // 3. Build the replacement static invoke expression.
-            // Original args: [arg0, arg1, ...]
-            // New args: [receiver, arg0, arg1, ...]
+            // Rewrite the call site.
+            // Before: virtualinvoke base.<C: R m(T...)>(args)
+            // After: staticinvoke <C: R __mono_m(C,T...)>(base, args)
             // ------------------------------------------------------------------
             List<Value> newArgs = new ArrayList<>();
             Value receiver = iie.getBase();
-
-            // The stub's first parameter type is the declaring class type.
-            // If the receiver's type is a sub-type we may need a cast local.
-            Type expectedReceiverType = singleTarget.getDeclaringClass().getType();
-            Value receiverArg = ensureType(receiver, expectedReceiverType, stmt, body);
-
-            newArgs.add(receiverArg);
-            newArgs.addAll(invokeExpr.getArgs());
+            Type declaredReceiverType = singleTarget.getDeclaringClass().getType();
+            newArgs.add(ensureType(receiver, declaredReceiverType, stmt, body));
+            newArgs.addAll(ie.getArgs());
 
             StaticInvokeExpr staticInvoke = Jimple.v().newStaticInvokeExpr(stub.makeRef(), newArgs);
 
-            // ------------------------------------------------------------------
-            // 4. Patch the statement in-place.
-            // ------------------------------------------------------------------
-            if (stmt instanceof AssignStmt) {
+            if (stmt instanceof AssignStmt)
                 ((AssignStmt) stmt).setRightOp(staticInvoke);
-            } else if (stmt instanceof InvokeStmt) {
+            else if (stmt instanceof InvokeStmt)
                 ((InvokeStmt) stmt).setInvokeExpr(staticInvoke);
-            }
-            // Other statement kinds (e.g., ThrowStmt) don't carry invoke exprs
-            // in the way that would reach here.
 
             changed = true;
         }
@@ -228,64 +232,194 @@ public class AnalysisTransformer extends SceneTransformer {
         return changed;
     }
 
-    // -------------------------------------------------------------------------
-    // Helper: resolve single call-graph target
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // Oracle 1 — PTA-based (original application methods only)
+    // =========================================================================
 
     /**
-     * Returns the unique {@link SootMethod} target of a call site, or
-     * {@code null} if there are zero or more than one targets.
+     * Context-insensitive monomorphism check via PTA.
+     *
+     * Collects the union of concrete callee {@link SootMethod}s seen at
+     * {@code site} across every context of {@code method}. Returns the unique
+     * callee, or {@code null} if zero or more than one.
+     *
+     * Implements the "5B / 5C" stubs in {@code ObjectSensitivePTA.java}.
      */
-    private SootMethod getSingleTarget(Iterator<Edge> edges) {
-        SootMethod target = null;
-        while (edges.hasNext()) {
-            Edge edge = edges.next();
-            SootMethod tgt = edge.getTgt().method();
-            if (target == null) {
-                target = tgt;
-            } else if (!target.equals(tgt)) {
-                // More than one distinct target → not mono-morphic.
-                return null;
-            }
+    private SootMethod ptaSingleTarget(SootMethod method, Stmt site) {
+        Set<SootMethod> targets = new HashSet<>();
+
+        for (ObjectSensitivePTA.ContextMethod cm : pta.reachable.keySet()) {
+            if (!cm.method.equals(method))
+                continue;
+
+            Map<Stmt, Set<ObjectSensitivePTA.ContextMethod>> siteMap = pta.callGraph.get(cm);
+            if (siteMap == null)
+                continue;
+
+            Set<ObjectSensitivePTA.ContextMethod> callees = siteMap.get(site);
+            if (callees == null)
+                continue;
+
+            for (ObjectSensitivePTA.ContextMethod callee : callees)
+                targets.add(callee.method);
         }
-        return target; // null if no edges at all; non-null unique target otherwise.
+
+        return targets.size() == 1 ? targets.iterator().next() : null;
     }
 
-    // -------------------------------------------------------------------------
-    // Helper: static stub creation
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // Oracle 2 — Exact-local static dispatch (stub bodies only)
+    // =========================================================================
 
     /**
-     * Returns a cached static stub for {@code original}, or creates, registers,
-     * and populates one if it does not yet exist.
+     * Resolves a virtual call inside a stub body, firing ONLY when the
+     * receiver base is provably exact-typed.
      *
-     * <p>
-     * The stub has the same name as the original, prefixed with
-     * {@code "__mono_"}, resides in the same class, and carries an extra first
-     * parameter of the declaring class type (the explicit receiver).
+     * <h3>Exact-type conditions</h3>
+     * <ol>
+     * <li><b>{@code exactReceiver} identity check</b> — the base local is
+     * the same object as the stub's {@code r0_explicit}. That local's
+     * declared type is the exact concrete class the PTA proved, so
+     * {@code resolveConcreteDispatch} on it is sound and complete.</li>
+     * <li><b>Final declared type</b> — no subclass can exist in any
+     * well-typed Java program, so the declared type equals the runtime
+     * type regardless of what value flows in.</li>
+     * </ol>
+     *
+     * <h3>What is deliberately NOT dispatched on</h3>
+     * Any local whose declared type is a non-final class other than the
+     * stub's own {@code r0_explicit} is skipped. In the X.jimple case:
+     * 
+     * <pre>
+     *   __mono_call(X r0_explicit, A r0)
+     *       virtualinvoke r0.&lt;A: void foo()&gt;();
+     * </pre>
+     * 
+     * {@code r0} has declared type {@code A} (not final, not {@code r0_explicit}),
+     * so this oracle returns {@code null} and the virtual call is preserved —
+     * which is correct because at runtime {@code r0} could be an {@code A} or
+     * a {@code B}.
+     *
+     * @param iie           the virtual/interface invoke expression to resolve
+     * @param exactReceiver the stub's own {@code r0_explicit} local
+     * @return the unique concrete target, or {@code null}
+     */
+    private SootMethod exactLocalSingleTarget(InstanceInvokeExpr iie,
+            Local exactReceiver) {
+        Value base = iie.getBase();
+        if (!(base instanceof Local))
+            return null;
+        Local baseLocal = (Local) base;
+
+        // ---- Determine whether this local is provably exact-typed ----------
+        boolean isExact = false;
+
+        // Condition 1: base IS the stub's own receiver local.
+        if (baseLocal == exactReceiver) {
+            isExact = true;
+        }
+
+        // Condition 2: declared type is a final class.
+        if (!isExact) {
+            Type t = baseLocal.getType();
+            if (t instanceof RefType) {
+                SootClass sc = ((RefType) t).getSootClass();
+                if (!sc.isInterface() && !sc.isAbstract()
+                        && !sc.isPhantom()
+                        && Modifier.isFinal(sc.getModifiers())) {
+                    isExact = true;
+                }
+            }
+        }
+
+        if (!isExact)
+            return null;
+
+        // ---- Resolve concrete dispatch on the exact declared type ----------
+        Type receiverType = baseLocal.getType();
+        if (!(receiverType instanceof RefType))
+            return null;
+        SootClass receiverClass = ((RefType) receiverType).getSootClass();
+
+        if (receiverClass.isInterface()
+                || receiverClass.isAbstract()
+                || receiverClass.isPhantom())
+            return null;
+
+        try {
+            SootMethod resolved = Scene.v().getActiveHierarchy()
+                    .resolveConcreteDispatch(
+                            receiverClass, iie.getMethodRef().resolve());
+            if (resolved == null || !resolved.isConcrete())
+                return null;
+            return resolved;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // =========================================================================
+    // Context-sensitive query (bonus — for downstream passes)
+    // =========================================================================
+
+    /**
+     * Returns the single concrete target seen from context-method {@code cm}
+     * at {@code site}, or {@code null} if polymorphic / unreachable.
+     * Implements the "5A" stub in {@code ObjectSensitivePTA.java}.
+     */
+    public SootMethod ptaSingleTargetForContext(
+            ObjectSensitivePTA.ContextMethod cm, Stmt site) {
+        Map<Stmt, Set<ObjectSensitivePTA.ContextMethod>> siteMap = pta.callGraph.get(cm);
+        if (siteMap == null)
+            return null;
+        Set<ObjectSensitivePTA.ContextMethod> callees = siteMap.get(site);
+        if (callees == null || callees.isEmpty())
+            return null;
+        SootMethod single = null;
+        for (ObjectSensitivePTA.ContextMethod callee : callees) {
+            if (single == null)
+                single = callee.method;
+            else if (!single.equals(callee.method))
+                return null;
+        }
+        return single;
+    }
+
+    // =========================================================================
+    // Static stub creation
+    // =========================================================================
+
+    /**
+     * Returns a cached static stub for {@code original}, creating and
+     * registering one if it does not yet exist.
+     *
+     * <h3>Registration-before-build (recursion safety)</h3>
+     * The stub is placed in {@link #staticStubCache} and
+     * {@link #stubReceiverLocal} <em>before</em> {@link #buildStubBody} runs.
+     * Any recursive virtual call on {@code r0_explicit} inside the cloned body
+     * resolves via Oracle 2 to the same original method, which hits the cache
+     * and returns this stub — no infinite loop.
+     *
+     * <h3>Eager stub-body devirtualization</h3>
+     * Immediately after building the body, {@link #transformStubBody} applies
+     * Oracle 2 to the new stub, turning any remaining virtual calls on exact
+     * locals into further static-stub calls. Those nested stubs are created
+     * recursively and also devirtualized immediately.
      */
     private SootMethod getOrCreateStaticStub(SootMethod original) {
-        if (staticStubCache.containsKey(original)) {
-            return staticStubCache.get(original);
-        }
+        SootMethod cached = staticStubCache.get(original);
+        if (cached != null)
+            return cached;
 
         SootClass declaringClass = original.getDeclaringClass();
 
-        // ------------------------------------------------------------------
-        // Build parameter list: (DeclaringClass receiver, <original params>)
-        // ------------------------------------------------------------------
+        // Parameter list: (DeclaringClass receiver, <original params>)
         List<Type> stubParams = new ArrayList<>();
-        stubParams.add(declaringClass.getType()); // explicit receiver
+        stubParams.add(declaringClass.getType());
         stubParams.addAll(original.getParameterTypes());
 
-        // ------------------------------------------------------------------
-        // Derive a unique name that avoids clashes with existing methods.
-        // ------------------------------------------------------------------
         String stubName = uniqueStubName(declaringClass, original, stubParams);
 
-        // ------------------------------------------------------------------
-        // Create and register the stub SootMethod.
-        // ------------------------------------------------------------------
         SootMethod stub = new SootMethod(
                 stubName,
                 stubParams,
@@ -294,98 +428,88 @@ public class AnalysisTransformer extends SceneTransformer {
                 original.getExceptions());
 
         declaringClass.addMethod(stub);
-        // Register in cache BEFORE populating the body to handle recursive cases.
-        staticStubCache.put(original, stub);
 
-        // ------------------------------------------------------------------
-        // Build the stub body.
-        // ------------------------------------------------------------------
-        buildStubBody(stub, original);
+        // *** Register BEFORE body build — handles direct/mutual recursion ***
+        staticStubCache.put(original, stub);
+        stubToOriginal.put(stub, original);
+        // stubReceiverLocal will be filled by buildStubBody below.
+
+        buildStubBody(stub, original); // clones + patches
+        transformStubBody(stub); // Oracle 2 pass on the new stub
 
         return stub;
     }
 
     /**
-     * Returns a method name that does not already exist in {@code cls} with the
-     * given parameter types.
+     * Runs Oracle 2 on a stub body until convergence.
+     * The loop is needed for chains (stub A calls B calls C …); each pass may
+     * create new stubs that are themselves devirtualized recursively, so
+     * normally one pass suffices, but we loop defensively.
      */
-    private String uniqueStubName(SootClass cls, SootMethod original, List<Type> params) {
-        String base = "__mono_" + original.getName();
-        String candidate = base;
-        int suffix = 0;
-        while (cls.declaresMethod(candidate, params)) {
-            candidate = base + "_" + (++suffix);
-        }
-        return candidate;
+    private void transformStubBody(SootMethod stub) {
+        if (!stub.hasActiveBody())
+            return;
+        Local exactReceiver = stubReceiverLocal.get(stub);
+        if (exactReceiver == null)
+            return; // should not happen
+
+        Body body = stub.getActiveBody();
+        boolean changed;
+        int guard = 0;
+        do {
+            changed = transformBody(body, exactReceiver);
+        } while (changed && ++guard < 32);
     }
 
+    // =========================================================================
+    // Stub body builder
+    // =========================================================================
+
     /**
-     * Populates {@code stub} with a Jimple body that:
-     * <ol>
-     * <li>Receives the receiver as {@code @parameter 0} (type = declaring
-     * class).</li>
-     * <li>Receives the original parameters as {@code @parameter 1..n}.</li>
-     * <li>Reads the original method's body.</li>
-     * <li>Replaces every occurrence of {@code @this} with the explicit receiver
-     * parameter, and every {@code @parameter i} with {@code @parameter i+1}.</li>
-     * <li>Clones all locals, traps, and units from the original body into the
-     * stub body, applying the parameter remapping.</li>
-     * </ol>
+     * Clones {@code original}'s Jimple body into {@code stub}, performing the
+     * following rewrites:
+     * <ul>
+     * <li>Adds explicit receiver local {@code r0_explicit} of the declaring
+     * class type; removes the {@code @this} identity statement.</li>
+     * <li>Shifts every {@code @parameter i} to {@code @parameter i+1}.</li>
+     * <li>Replaces all uses of the original {@code @this} local with
+     * {@code r0_explicit}.</li>
+     * <li>Maps all other original locals to fresh cloned counterparts.</li>
+     * <li>Clones traps with updated unit references.</li>
+     * </ul>
+     * Registers {@code r0_explicit} in {@link #stubReceiverLocal} so that
+     * {@link #transformStubBody} can pass it to Oracle 2.
      */
     private void buildStubBody(SootMethod stub, SootMethod original) {
-        // Ensure original has a body we can clone.
-        if (!original.hasActiveBody()) {
-            try {
-                original.retrieveActiveBody();
-            } catch (Exception e) {
-                // Fallback: empty body that just returns.
-                buildEmptyStubBody(stub);
-                return;
-            }
-        }
-
+        // if (!original.hasActiveBody()
+        //         || original.getDeclaringClass().isJavaLibraryClass()) {
+        //     buildEmptyStubBody(stub);
+        //     return;
+        // }
         Body origBody = original.getActiveBody();
-
-        // ------------------------------------------------------------------
-        // Create a fresh Jimple body for the stub.
-        // ------------------------------------------------------------------
         JimpleBody stubBody = Jimple.v().newBody(stub);
         stub.setActiveBody(stubBody);
 
-        // ------------------------------------------------------------------
-        // Determine the original @this local and @parameter locals.
-        // ------------------------------------------------------------------
         Local origThisLocal = origBody.getThisLocal();
 
-        // Map: original local → stub local (we clone all locals).
-        Map<Local, Local> localMap = new HashMap<>();
-
         // Clone locals.
+        Map<Local, Local> localMap = new HashMap<>();
         for (Local origLocal : origBody.getLocals()) {
-            Local stubLocal = Jimple.v().newLocal(origLocal.getName(), origLocal.getType());
-            stubBody.getLocals().add(stubLocal);
-            localMap.put(origLocal, stubLocal);
+            Local cl = Jimple.v().newLocal(origLocal.getName(), origLocal.getType());
+            stubBody.getLocals().add(cl);
+            localMap.put(origLocal, cl);
         }
 
-        // Add the explicit receiver parameter local (r0_explicit).
+        // Add the explicit receiver local.
         Local receiverLocal = Jimple.v().newLocal(
                 "r0_explicit", original.getDeclaringClass().getType());
         stubBody.getLocals().add(receiverLocal);
 
-        // ------------------------------------------------------------------
-        // Build a value substitutor using a box-based visitor.
-        // ------------------------------------------------------------------
-        // We use Soot's cloneBody utility then patch identity statements.
+        // Register it NOW so recursion is handled before body patching.
+        stubReceiverLocal.put(stub, receiverLocal);
 
-        // Clone the original body's unit graph into the stub.
-        // Soot provides Body.importBodyContentsFrom which deep-clones units,
-        // locals (we've already added them), and traps.
-        // We'll clone units manually to control @this / @parameter remapping.
-
-        // Traps (exception handlers): clone with updated unit references later.
-        // We'll track original->stub unit mapping.
+        // Clone units.
         Map<Unit, Unit> unitMap = new HashMap<>();
-
         for (Unit origUnit : origBody.getUnits()) {
             Unit cloned = (Unit) origUnit.clone();
             stubBody.getUnits().add(cloned);
@@ -394,174 +518,125 @@ public class AnalysisTransformer extends SceneTransformer {
 
         // Clone traps.
         for (Trap origTrap : origBody.getTraps()) {
-            Trap cloned = Jimple.v().newTrap(
+            stubBody.getTraps().add(Jimple.v().newTrap(
                     origTrap.getException(),
                     unitMap.get(origTrap.getBeginUnit()),
                     unitMap.get(origTrap.getEndUnit()),
-                    unitMap.get(origTrap.getHandlerUnit()));
-            stubBody.getTraps().add(cloned);
+                    unitMap.get(origTrap.getHandlerUnit())));
         }
 
-        // ------------------------------------------------------------------
         // Patch identity statements and local references.
-        // ------------------------------------------------------------------
-        // After cloning, the cloned body still contains IdentityStmt with
-        // ThisRef / ParameterRef pointing to the original method's indices.
-        // We need to:
-        // - Replace @this → @parameter 0 (receiverLocal) in the stub.
-        // - Replace @param i → @parameter i+1 in the stub.
-        // - Replace all Value uses of origThisLocal → receiverLocal.
-        // - Replace all Value uses of other original locals → their stub clones.
-
-        Unit clonedThisIdentityUnit = null;
-        ArrayList<Unit> unitList = new ArrayList<>(stubBody.getUnits());
-
-        for (Unit unit : unitList) {
+        Unit clonedThisIdentity = null;
+        for (Unit unit : new ArrayList<>(stubBody.getUnits())) {
             Stmt stmt = (Stmt) unit;
 
-            // Fix IdentityStmt (e.g. r0 := @this, x := @parameter 0)
             if (stmt instanceof IdentityStmt) {
-                IdentityStmt idStmt = (IdentityStmt) stmt;
-                Value rightOp = idStmt.getRightOp();
-
-                if (rightOp instanceof ThisRef) {
-                    // Replace with: receiverLocal := @parameter 0
-                    // idStmt.setRightOp(Jimple.v().newParameterRef(stub.getParameterType(0), 0));
-
-                    clonedThisIdentityUnit = unit;
-
-                    // The left-hand side local was cloned from origThisLocal;
-                    // update localMap so further uses are replaced correctly.
-                    // Actually we handle this via the general local-replacement pass below.
-                } else if (rightOp instanceof ParameterRef) {
-                    ParameterRef pr = (ParameterRef) rightOp;
-                    // Shift index by 1 (slot 0 is now the explicit receiver).
-                    int newIndex = pr.getIndex() + 1;
-                    idStmt.setRightOp(Jimple.v().newParameterRef(
-                            stub.getParameterType(newIndex), newIndex));
+                IdentityStmt id = (IdentityStmt) stmt;
+                Value rhs = id.getRightOp();
+                if (rhs instanceof ThisRef) {
+                    clonedThisIdentity = unit; // will be removed
+                } else if (rhs instanceof ParameterRef) {
+                    int newIdx = ((ParameterRef) rhs).getIndex() + 1;
+                    id.setRightOp(Jimple.v().newParameterRef(
+                            stub.getParameterType(newIdx), newIdx));
                 }
             }
 
-            // Replace all local references in every ValueBox.
             for (ValueBox vb : stmt.getUseAndDefBoxes()) {
                 Value v = vb.getValue();
                 if (v instanceof Local) {
-                    Local origLocal = (Local) v;
-                    if (origLocal.equals(origThisLocal)) {
-                        // References to the original @this → receiverLocal
+                    Local orig = (Local) v;
+                    if (orig.equals(origThisLocal))
                         vb.setValue(receiverLocal);
-                    } else if (localMap.containsKey(origLocal)) {
-                        vb.setValue(localMap.get(origLocal));
-                    }
-                    // Locals already pointing to stub locals are fine as-is.
+                    else if (localMap.containsKey(orig))
+                        vb.setValue(localMap.get(orig));
                 }
             }
         }
 
-        if (clonedThisIdentityUnit != null) {
-            stubBody.getUnits().remove(clonedThisIdentityUnit);
-        }
+        if (clonedThisIdentity != null)
+            stubBody.getUnits().remove(clonedThisIdentity);
 
-        // Wire up the receiver identity statement at the top.
-        // The cloned @this identity stmt now sets a cloned local to @parameter 0,
-        // but we want receiverLocal to carry the receiver. Insert a fresh
-        // identity statement for receiverLocal BEFORE all others and remove the
-        // clone of the original @this identity.
+        // Prepend: r0_explicit := @parameter 0
+        stubBody.getUnits().insertBefore(
+                Jimple.v().newIdentityStmt(
+                        receiverLocal,
+                        Jimple.v().newParameterRef(stub.getParameterType(0), 0)),
+                stubBody.getUnits().getFirst());
 
-        IdentityStmt receiverIdStmt = Jimple.v().newIdentityStmt(
-                receiverLocal,
-                Jimple.v().newParameterRef(stub.getParameterType(0), 0));
-
-        // Remove the cloned @this identity (it now assigns a regular cloned local
-        // to @parameter 0 — we'll keep it to preserve the local but we might
-        // want to drop it to avoid unused locals; keeping it is safe for Jimple).
-        // Insert receiver identity at the very beginning.
-        Unit firstUnit = stubBody.getUnits().getFirst();
-        stubBody.getUnits().insertBefore(receiverIdStmt, firstUnit);
-
-        // Validate (optional, catches Jimple type errors during development).
         try {
             stubBody.validate();
         } catch (Exception e) {
-            System.err.println("[Monomorphization] Warning: stub body validation failed for "
+            System.err.println("[Mono/PTA] Warning: stub validation failed for "
                     + stub.getSignature() + ": " + e.getMessage());
         }
     }
 
-    /**
-     * Fallback: build a minimal valid stub body that just returns the default
-     * value (used when the original body cannot be retrieved).
-     */
+    /** Minimal stub body for when the original body cannot be retrieved. */
     private void buildEmptyStubBody(SootMethod stub) {
         JimpleBody body = Jimple.v().newBody(stub);
         stub.setActiveBody(body);
-
-        // Add identity statements for each parameter.
-        List<Local> paramLocals = new ArrayList<>();
         for (int i = 0; i < stub.getParameterCount(); i++) {
             Local p = Jimple.v().newLocal("p" + i, stub.getParameterType(i));
             body.getLocals().add(p);
             body.getUnits().add(Jimple.v().newIdentityStmt(
                     p, Jimple.v().newParameterRef(stub.getParameterType(i), i)));
-            paramLocals.add(p);
         }
-
-        Type retType = stub.getReturnType();
-        if (retType instanceof VoidType) {
+        Type ret = stub.getReturnType();
+        if (ret instanceof VoidType) {
             body.getUnits().add(Jimple.v().newReturnVoidStmt());
         } else {
-            Local retLocal = Jimple.v().newLocal("ret", retType);
-            body.getLocals().add(retLocal);
-            body.getUnits().add(Jimple.v().newAssignStmt(
-                    retLocal, defaultValue(retType)));
-            body.getUnits().add(Jimple.v().newReturnStmt(retLocal));
+            Local r = Jimple.v().newLocal("ret", ret);
+            body.getLocals().add(r);
+            body.getUnits().add(Jimple.v().newAssignStmt(r, defaultValue(ret)));
+            body.getUnits().add(Jimple.v().newReturnStmt(r));
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Helper: ensure receiver has the correct declared type (insert cast if needed)
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // Helpers
+    // =========================================================================
 
-    /**
-     * If {@code value}'s type already conforms to {@code targetType}, returns
-     * {@code value} unchanged. Otherwise inserts a cast statement before
-     * {@code insertBefore} and returns a new typed local holding the cast result.
-     */
-    private Value ensureType(Value value, Type targetType, Stmt insertBefore, Body body) {
-        Type valueType = value.getType();
-        if (valueType.equals(targetType)) {
+    private String uniqueStubName(SootClass cls, SootMethod original,
+            List<Type> params) {
+        String base = "__mono_" + original.getName();
+        String candidate = base;
+        int suffix = 0;
+        while (cls.declaresMethod(candidate, params))
+            candidate = base + "_" + (++suffix);
+        return candidate;
+    }
+
+    private Value ensureType(Value value, Type targetType,
+            Stmt insertBefore, Body body) {
+        if (value.getType().equals(targetType))
             return value;
-        }
-        // Insert: castLocal = (TargetType) value
-        Local castLocal = Jimple.v().newLocal(
+        Local cast = Jimple.v().newLocal(
                 "$cast_" + System.identityHashCode(value), targetType);
-        body.getLocals().add(castLocal);
-        AssignStmt castStmt = Jimple.v().newAssignStmt(
-                castLocal,
-                Jimple.v().newCastExpr(value, targetType));
-        body.getUnits().insertBefore(castStmt, insertBefore);
-        return castLocal;
+        body.getLocals().add(cast);
+        body.getUnits().insertBefore(
+                Jimple.v().newAssignStmt(
+                        cast, Jimple.v().newCastExpr(value, targetType)),
+                insertBefore);
+        return cast;
     }
-
-    // -------------------------------------------------------------------------
-    // Helper: default (zero) value for a type
-    // -------------------------------------------------------------------------
 
     private Value defaultValue(Type t) {
-        if (t instanceof IntType
-                || t instanceof ByteType
-                || t instanceof ShortType
-                || t instanceof CharType
-                || t instanceof BooleanType) {
+        if (t instanceof IntType || t instanceof ByteType
+                || t instanceof ShortType || t instanceof CharType
+                || t instanceof BooleanType)
             return IntConstant.v(0);
-        } else if (t instanceof LongType) {
+        if (t instanceof LongType)
             return LongConstant.v(0L);
-        } else if (t instanceof FloatType) {
+        if (t instanceof FloatType)
             return FloatConstant.v(0.0f);
-        } else if (t instanceof DoubleType) {
+        if (t instanceof DoubleType)
             return DoubleConstant.v(0.0);
-        } else {
-            return NullConstant.v(); // reference types
-        }
+        return NullConstant.v();
+    }
+
+    /** Returns the PTA instance (valid after {@link #internalTransform}). */
+    public ObjectSensitivePTA getPTA() {
+        return pta;
     }
 }
