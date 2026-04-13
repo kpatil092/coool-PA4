@@ -132,6 +132,7 @@ public class ObjectSensitivePTA {
     /** Returns true if any points-to set grew (so the caller can re-enqueue). */
     private boolean processAssign(AssignStmt stmt, ContextMethod cm) {
         boolean changed = false;
+        boolean heapChanged = false;
         Value lhs = stmt.getLeftOp();
         Value rhs = stmt.getRightOp();
 
@@ -142,7 +143,7 @@ public class ObjectSensitivePTA {
             if (rhs instanceof NewExpr) {
                 // x = new T()
                 SootClass allocClass = ((RefType) ((NewExpr) rhs).getBaseType()).getSootClass();
-                AllocObject obj = allocFor(rhs.toString(), allocClass, cm);
+                AllocObject obj = allocFor(stmt.toString(), allocClass, cm);
                 changed |= lhsVar.pointsTo.add(obj);
 
             } else if (rhs instanceof Local) {
@@ -184,7 +185,7 @@ public class ObjectSensitivePTA {
 
             } else if (rhs instanceof NewArrayExpr || rhs instanceof NewMultiArrayExpr) {
                 // Treat array allocation like a regular object.
-                AllocObject obj = allocFor(rhs.toString(), null, cm);
+                AllocObject obj = allocFor(stmt.toString(), null, cm);
                 changed |= lhsVar.pointsTo.add(obj);
             }
 
@@ -199,7 +200,9 @@ public class ObjectSensitivePTA {
                 for (AllocObject obj : new ArrayList<>(baseVar.pointsTo)) {
                     if (obj == NULL_OBJ)
                         continue;
-                    changed |= obj.getField(field).addAll(rhsVar.pointsTo);
+                    boolean fieldChanged = obj.getField(field).addAll(rhsVar.pointsTo);
+                    changed |= fieldChanged;
+                    heapChanged |= fieldChanged;
                 }
             }
 
@@ -209,9 +212,14 @@ public class ObjectSensitivePTA {
             SootField field = ((StaticFieldRef) lhs).getField();
             if (rhs instanceof Local) {
                 PTAVar rhsVar = varFor((Local) rhs, cm);
-                changed |= getStaticField(field).addAll(rhsVar.pointsTo);
+                boolean fieldChanged = getStaticField(field).addAll(rhsVar.pointsTo);
+                changed |= fieldChanged;
+                heapChanged |= fieldChanged;
             }
         }
+
+        if (heapChanged)
+            requeueAll();
 
         return changed;
     }
@@ -261,6 +269,8 @@ public class ObjectSensitivePTA {
         if (retDst != null)
             changed |= calleeContext.returnDests.add(retDst);
         changed |= pairArgs(se.getArgs(), cm, callee, calleeContext);
+        if (changed)
+            enqueue(calleeContext);
         return changed;
     }
 
@@ -285,6 +295,8 @@ public class ObjectSensitivePTA {
             if (retDst != null)
                 changed |= calleeContext.returnDests.add(retDst);
             changed |= pairArgs(se.getArgs(), cm, callee, calleeContext);
+            if (changed)
+                enqueue(calleeContext);
         }
         return changed;
     }
@@ -313,6 +325,8 @@ public class ObjectSensitivePTA {
             if (retDst != null)
                 changed |= calleeContext.returnDests.add(retDst);
             changed |= pairArgs(ie.getArgs(), cm, callee, calleeContext);
+            if (changed)
+                enqueue(calleeContext);
         }
         return changed;
     }
@@ -408,9 +422,11 @@ public class ObjectSensitivePTA {
         return getOrCreateVar(local.getName(), cm);
     }
 
-    /** 'this' variable in a callee context, using Jimple's "@this" name. */
     private PTAVar varForThis(ContextMethod cm) {
-        return getOrCreateVar("@this", cm);
+        if (!cm.method.isConcrete() || !cm.method.hasActiveBody() || cm.method.isStatic()) {
+            return getOrCreateVar("@this", cm);
+        }
+        return varFor(cm.method.getActiveBody().getThisLocal(), cm);
     }
 
     private PTAVar getOrCreateVar(String localName, ContextMethod cm) {
