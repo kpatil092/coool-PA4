@@ -537,12 +537,23 @@ public class ObjectSensitivePTA {
                 Stmt site = callSite.getKey();
                 System.out.println("  Call site: " + site);
                 for (ContextMethod callee : callSite.getValue()) {
-                    System.out.println("    Callee: " + callee.method.getSignature() + " in context " + ctxKey(callee.context) );
+                    System.out.println(
+                            "    Callee: " + callee.method.getSignature() + " in context " + ctxKey(callee.context));
                 }
                 System.out.println("<><><><><>");
             }
             System.out.println("-----------------------------\n---------------------------");
         }
+    }
+
+    public Set<ContextMethod> getTargets(ContextMethod cm, Stmt site) {
+        return callGraph
+                .getOrDefault(cm, Collections.emptyMap())
+                .getOrDefault(site, Collections.emptySet());
+    }
+
+    public Set<ContextMethod> getReachableContexts() {
+        return new LinkedHashSet<>(reachable.keySet());
     }
 }
 

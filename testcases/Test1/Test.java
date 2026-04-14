@@ -26,7 +26,6 @@ class P extends O {
 }
 
 public class Test {
-    
     public static void main(String[] args) {
         { // Case 1
             M o1 = new M(); // 031
