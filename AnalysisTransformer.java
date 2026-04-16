@@ -1,26 +1,23 @@
 import soot.*;
 import soot.jimple.*;
-import soot.jimple.toolkits.invoke.InlinerSafetyManager;
-import soot.jimple.toolkits.invoke.SiteInliner;
-import soot.util.Chain;
+import soot.util.*;
 
 import java.util.*;
 
 public class AnalysisTransformer extends SceneTransformer {
 
-    static final int INLINE_UNIT_LIMIT = 6;
-    static final int PIC_LIMIT = 10;
+    final int PIC_LIMIT = 1;
 
     final int k;
 
-    final Map<ObjectSensitivePTA.ContextMethod, SootMethod> staticStubCache = new HashMap<>();
-    final Map<SootMethod, StubInfo> stubInfo = new HashMap<>();
+    Map<ObjectSensitivePTA.ContextMethod, SootMethod> ctxToStubMap = new HashMap<>();
+    Map<SootMethod, StubInfo> stubInfoMap = new HashMap<>();
 
     ObjectSensitivePTA pta;
 
-    static final class StubInfo {
-        final ObjectSensitivePTA.ContextMethod contextMethod;
-        final Map<Stmt, Stmt> originalSiteByStubSite = new IdentityHashMap<>();
+    static class StubInfo {
+        ObjectSensitivePTA.ContextMethod contextMethod;
+        Map<Stmt, Stmt> originalSiteByStubSite = new HashMap<>();
         Local receiverLocal;
 
         StubInfo(ObjectSensitivePTA.ContextMethod contextMethod) {
@@ -28,11 +25,11 @@ public class AnalysisTransformer extends SceneTransformer {
         }
     }
 
-    static final class AccessInfo {
-        final Set<Local> receiverRootedLocals = new LinkedHashSet<>();
-        final Set<Local> parameterLocals = new LinkedHashSet<>();
-        final Set<Local> parameterCopies = new LinkedHashSet<>();
-        final Set<Local> allowedBases = new LinkedHashSet<>();
+    static class AccessInfo {
+        Set<Local> receiverRootedLocals = new LinkedHashSet<>();
+        Set<Local> parameterLocals = new LinkedHashSet<>();
+        Set<Local> parameterCopies = new LinkedHashSet<>();
+        Set<Local> allowedBases = new LinkedHashSet<>();
 
         static AccessInfo empty() {
             return new AccessInfo();
@@ -87,8 +84,7 @@ public class AnalysisTransformer extends SceneTransformer {
                 worklist.add(method);
         }
 
-        // inlineSmallStaticStubs();
-        System.out.println("[Mono/PTA] Static stubs created: " + staticStubCache.size());
+        System.out.println("[Mono/PTA] Static stubs created: " + ctxToStubMap.size());
     }
 
     boolean transformBody(Body body, StubInfo stub) {
@@ -164,67 +160,10 @@ public class AnalysisTransformer extends SceneTransformer {
                 continue;
             }
 
-            // else → leave virtual
+            // else virtual
         }
 
         return changed;
-    }
-
-    ObjectSensitivePTA.ContextMethod ptaSingleTargetContext(SootMethod method, Stmt site) {
-        Set<ObjectSensitivePTA.ContextMethod> targets = new LinkedHashSet<>();
-
-        for (ObjectSensitivePTA.ContextMethod cm : pta.getReachableContexts()) {
-            if (!cm.method.equals(method))
-                continue;
-            targets.addAll(pta.getTargets(cm, site));
-        }
-
-        return targets.size() == 1 ? targets.iterator().next() : null;
-    }
-
-    ObjectSensitivePTA.ContextMethod ptaSingleTargetForContextContext(
-            ObjectSensitivePTA.ContextMethod cm, Stmt site) {
-        if (site == null)
-            return null;
-        Set<ObjectSensitivePTA.ContextMethod> callees = pta.getTargets(cm, site);
-        if (callees.isEmpty())
-            return null;
-        return callees.size() == 1 ? callees.iterator().next() : null;
-    }
-
-    ObjectSensitivePTA.ContextMethod stubSingleTarget(
-            StubInfo stub,
-            Stmt originalSite,
-            InstanceInvokeExpr iie,
-            AccessInfo accessInfo,
-            Local baseLocal) {
-        if (baseLocal == null)
-            return null;
-        if (!accessInfo.allowedBases.contains(baseLocal))
-            return null;
-
-        ObjectSensitivePTA.ContextMethod ptaTarget = ptaSingleTargetForContextContext(stub.contextMethod, originalSite);
-        if (ptaTarget != null)
-            return ptaTarget;
-
-        SootMethod exactTarget = exactLocalSingleTarget(iie, stub.receiverLocal);
-        if (exactTarget == null)
-            return null;
-
-        ObjectSensitivePTA.ContextMethod match = null;
-        for (ObjectSensitivePTA.ContextMethod cm : pta.getReachableContexts()) {
-            if (!cm.method.equals(exactTarget))
-                continue;
-            if (match != null && !match.equals(cm))
-                return null;
-            match = cm;
-        }
-        return match;
-    }
-
-    public SootMethod ptaSingleTargetForContext(ObjectSensitivePTA.ContextMethod cm, Stmt site) {
-        ObjectSensitivePTA.ContextMethod target = ptaSingleTargetForContextContext(cm, site);
-        return target == null ? null : target.method;
     }
 
     Set<ObjectSensitivePTA.ContextMethod> collectTargetsForSite(
@@ -255,6 +194,37 @@ public class AnalysisTransformer extends SceneTransformer {
         }
 
         return targets;
+    }
+
+    SootMethod getOrCreateStaticStub(ObjectSensitivePTA.ContextMethod targetContext) {
+        SootMethod cached = ctxToStubMap.get(targetContext);
+        if (cached != null)
+            return cached;
+
+        SootMethod original = targetContext.method;
+        SootClass declaringClass = original.getDeclaringClass();
+
+        List<Type> params = new ArrayList<>();
+        params.add(declaringClass.getType());
+        params.addAll(original.getParameterTypes());
+
+        String stubName = uniqueStubName(declaringClass, original, params, targetContext);
+        SootMethod stub = new SootMethod(
+                stubName,
+                params,
+                original.getReturnType(),
+                Modifier.PUBLIC | Modifier.STATIC,
+                original.getExceptions());
+
+        declaringClass.addMethod(stub);
+        ctxToStubMap.put(targetContext, stub);
+
+        StubInfo info = new StubInfo(targetContext);
+        stubInfoMap.put(stub, info);
+
+        buildStubBody(stub, original, info);
+        transformStubBody(stub);
+        return stub;
     }
 
     void emitPIC(
@@ -383,52 +353,6 @@ public class AnalysisTransformer extends SceneTransformer {
         units.remove(stmt);
     }
 
-    SootMethod getOrCreateStaticStub(ObjectSensitivePTA.ContextMethod targetContext) {
-        SootMethod cached = staticStubCache.get(targetContext);
-        if (cached != null)
-            return cached;
-
-        SootMethod original = targetContext.method;
-        SootClass declaringClass = original.getDeclaringClass();
-
-        List<Type> params = new ArrayList<>();
-        params.add(declaringClass.getType());
-        params.addAll(original.getParameterTypes());
-
-        String stubName = uniqueStubName(declaringClass, original, params, targetContext);
-        SootMethod stub = new SootMethod(
-                stubName,
-                params,
-                original.getReturnType(),
-                Modifier.PUBLIC | Modifier.STATIC,
-                original.getExceptions());
-
-        declaringClass.addMethod(stub);
-        staticStubCache.put(targetContext, stub);
-
-        StubInfo info = new StubInfo(targetContext);
-        stubInfo.put(stub, info);
-
-        buildStubBody(stub, original, info);
-        transformStubBody(stub);
-        return stub;
-    }
-
-    void transformStubBody(SootMethod stub) {
-        if (!stub.hasActiveBody())
-            return;
-
-        StubInfo info = stubInfo.get(stub);
-        if (info == null)
-            return;
-
-        boolean changed;
-        int guard = 0;
-        do {
-            changed = transformBody(stub.getActiveBody(), info);
-        } while (changed && ++guard < 32);
-    }
-
     void buildStubBody(SootMethod stub, SootMethod original, StubInfo info) {
         Body originalBody = original.getActiveBody();
         JimpleBody stubBody = Jimple.v().newBody(stub);
@@ -436,7 +360,7 @@ public class AnalysisTransformer extends SceneTransformer {
 
         Local originalThis = original.isStatic() ? null : originalBody.getThisLocal();
 
-        Map<Local, Local> localMap = new HashMap<>();
+        Map<Local, Local> localMap = new HashMap<>(); // NOTE: Local - local map (old to new)
         for (Local originalLocal : originalBody.getLocals()) {
             Local clonedLocal = Jimple.v().newLocal(originalLocal.getName(), originalLocal.getType());
             stubBody.getLocals().add(clonedLocal);
@@ -472,8 +396,6 @@ public class AnalysisTransformer extends SceneTransformer {
             Unit begin = unitMap.get(t.getBeginUnit());
             Unit end = unitMap.get(t.getEndUnit());
             Unit handler = unitMap.get(t.getHandlerUnit());
-
-            // ❗ Skip invalid traps (critical fix)
             if (begin == null || end == null || handler == null)
                 continue;
 
@@ -528,127 +450,27 @@ public class AnalysisTransformer extends SceneTransformer {
             appendDefaultReturn(stubBody, stub.getReturnType());
         }
 
-        try {
-            stubBody.validate();
-        } catch (RuntimeException e) {
-            System.err.println("[Mono/PTA] Warning: stub validation failed for "
-                    + stub.getSignature() + ": " + e.getMessage());
-        }
+        // try {
+        // stubBody.validate();
+        // } catch (RuntimeException e) {
+        // System.err.println("[Mono/PTA] Warning: stub validation failed for "
+        // + stub.getSignature() + ": " + e.getMessage());
+        // }
     }
 
-    void inlineSmallStaticStubs() {
+    void transformStubBody(SootMethod stub) {
+        if (!stub.hasActiveBody())
+            return;
+
+        StubInfo info = stubInfoMap.get(stub);
+        if (info == null)
+            return;
+
         boolean changed;
         int guard = 0;
         do {
-            changed = false;
-            for (SootMethod method : allTransformableMethods()) {
-                if (!method.hasActiveBody())
-                    continue;
-                if (inlineSmallStaticStubsInBody(method.getActiveBody()))
-                    changed = true;
-            }
-        } while (changed && ++guard < 8);
-    }
-
-    boolean inlineSmallStaticStubsInBody(Body body) {
-        boolean changed = false;
-        SootMethod caller = body.getMethod();
-        List<Unit> snapshot = new ArrayList<>(body.getUnits());
-
-        for (Unit unit : snapshot) {
-            if (!(unit instanceof Stmt))
-                continue;
-            Stmt stmt = (Stmt) unit;
-            if (!stmt.containsInvokeExpr())
-                continue;
-            InvokeExpr ie = stmt.getInvokeExpr();
-            if (!(ie instanceof StaticInvokeExpr))
-                continue;
-
-            SootMethod callee;
-            try {
-                callee = ((StaticInvokeExpr) ie).getMethod();
-            } catch (RuntimeException e) {
-                continue;
-            }
-
-            if (!stubInfo.containsKey(callee))
-                continue;
-            if (callee.equals(caller))
-                continue;
-            if (!isSmallInlineCandidate(callee))
-                continue;
-            if (!InlinerSafetyManager.ensureInlinability(callee, stmt, caller, "monoinline"))
-                continue;
-
-            SiteInliner.inlineSite(callee, stmt, caller);
-            changed = true;
-        }
-
-        return changed;
-    }
-
-    boolean isSmallInlineCandidate(SootMethod method) {
-        if (!method.hasActiveBody())
-            return false;
-        if (!method.isStatic())
-            return false;
-        Body body = method.getActiveBody();
-        if (!body.getTraps().isEmpty())
-            return false;
-
-        int meaningfulUnits = 0;
-        for (Unit unit : body.getUnits()) {
-            if (unit instanceof IdentityStmt)
-                continue;
-            meaningfulUnits++;
-            if (meaningfulUnits > INLINE_UNIT_LIMIT)
-                return false;
-        }
-        return true;
-    }
-
-    Collection<SootMethod> allTransformableMethods() {
-        LinkedHashSet<SootMethod> methods = new LinkedHashSet<>();
-        for (ObjectSensitivePTA.ContextMethod cm : pta.getReachableContexts())
-            methods.add(cm.method);
-        methods.addAll(stubInfo.keySet());
-        return methods;
-    }
-
-    String uniqueStubName(
-            SootClass declaringClass,
-            SootMethod original,
-            List<Type> params,
-            ObjectSensitivePTA.ContextMethod targetContext) {
-        String base = "__mono_" + original.getName() + contextSuffix(targetContext);
-        String candidate = base;
-        int suffix = 0;
-        while (declaringClass.declaresMethod(candidate, params))
-            candidate = base + "_" + (++suffix);
-        return candidate;
-    }
-
-    String contextSuffix(ObjectSensitivePTA.ContextMethod cm) {
-        if (cm.context.isEmpty())
-            return "__ctx0";
-        ObjectSensitivePTA.AllocObject receiver = cm.context.get(0);
-        String site = receiver == null ? "unknown" : sanitizeForMethodName(receiver.siteName);
-        return "__recv_" + site + "_" + Integer.toHexString(cm.context.hashCode());
-    }
-
-    String sanitizeForMethodName(String value) {
-        if (value == null || value.isEmpty())
-            return "ctx";
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < value.length(); i++) {
-            char ch = value.charAt(i);
-            if (Character.isLetterOrDigit(ch) || ch == '_')
-                sb.append(ch);
-            else
-                sb.append('_');
-        }
-        return sb.toString();
+            changed = transformBody(stub.getActiveBody(), info);
+        } while (changed && ++guard < 32);
     }
 
     AccessInfo computeAccessInfo(Body body, Local receiverLocal) {
@@ -718,44 +540,39 @@ public class AnalysisTransformer extends SceneTransformer {
         return info;
     }
 
-    SootMethod exactLocalSingleTarget(InstanceInvokeExpr iie, Local exactReceiver) {
-        Value base = iie.getBase();
-        if (!(base instanceof Local))
-            return null;
-        Local baseLocal = (Local) base;
+    String uniqueStubName(
+            SootClass declaringClass,
+            SootMethod original,
+            List<Type> params,
+            ObjectSensitivePTA.ContextMethod targetContext) {
+        String base = "staticStub" + original.getName() + contextSuffix(targetContext);
+        String candidate = base;
+        int suffix = 0;
+        while (declaringClass.declaresMethod(candidate, params))
+            candidate = base + "_" + (++suffix);
+        return candidate;
+    }
+    
+    String contextSuffix(ObjectSensitivePTA.ContextMethod cm) {
+        if (cm.context.isEmpty())
+            return "__ctx0";
+        ObjectSensitivePTA.AllocObject receiver = cm.context.get(0);
+        String site = receiver == null ? "unknown" : sanitizeForMethodName(receiver.siteName);
+        return "__recv_" + site + "_" + Integer.toHexString(cm.context.hashCode());
+    }
 
-        boolean isExact = baseLocal == exactReceiver;
-        if (!isExact) {
-            Type type = baseLocal.getType();
-            if (type instanceof RefType) {
-                SootClass receiverClass = ((RefType) type).getSootClass();
-                if (!receiverClass.isInterface()
-                        && !receiverClass.isAbstract()
-                        && !receiverClass.isPhantom()
-                        && Modifier.isFinal(receiverClass.getModifiers())) {
-                    isExact = true;
-                }
-            }
+    String sanitizeForMethodName(String value) {
+        if (value == null || value.isEmpty())
+            return "ctx";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            if (Character.isLetterOrDigit(ch) || ch == '_')
+                sb.append(ch);
+            else
+                sb.append('_');
         }
-
-        if (!isExact)
-            return null;
-
-        Type type = baseLocal.getType();
-        if (!(type instanceof RefType))
-            return null;
-
-        SootClass receiverClass = ((RefType) type).getSootClass();
-        if (receiverClass.isInterface() || receiverClass.isAbstract() || receiverClass.isPhantom())
-            return null;
-
-        try {
-            SootMethod resolved = Scene.v().getActiveHierarchy()
-                    .resolveConcreteDispatch(receiverClass, iie.getMethodRef().resolve());
-            return (resolved != null && resolved.isConcrete()) ? resolved : null;
-        } catch (RuntimeException e) {
-            return null;
-        }
+        return sb.toString();
     }
 
     Value ensureType(Value value, Type targetType, Stmt insertBefore, Body body) {
@@ -795,26 +612,12 @@ public class AnalysisTransformer extends SceneTransformer {
         return NullConstant.v();
     }
 
-    boolean isValidStubTarget(SootMethod method) {
-        if (method == null)
-            return false;
-        if (method.isNative())
-            return false;
-        if (method.isAbstract())
-            return false;
-        if (method.isStatic())
-            return false;
-        SootClass cls = method.getDeclaringClass();
-        if (cls.isPhantom())
-            return false;
-        if (cls.isJavaLibraryClass())
-            return false;
-        if (!method.hasActiveBody())
-            return false;
-        return true;
+    boolean isValidStubTarget(SootMethod m) {
+        return (
+            m != null && m.hasActiveBody() && !m.isNative() && 
+            !m.isAbstract() && !m.isStatic() && !m.getDeclaringClass().isPhantom() && 
+            !m.getDeclaringClass().isJavaLibraryClass()
+        );
     }
 
-    public ObjectSensitivePTA getPTA() {
-        return pta;
-    }
 }

@@ -36,12 +36,6 @@ public class ObjectSensitivePTA {
         SootMethod method;
         List<AllocObject> context;
 
-        /**
-         * Where callers want the return value propagated.
-         * Multiple callers may share the same (method, context) but want
-         * results in different variables → we keep a *set* of destinations
-         * and merge into all of them during return processing.
-         */
         Set<PTAVar> returnDests = new HashSet<>();
 
         ContextMethod(SootMethod method, List<AllocObject> context) {
@@ -79,7 +73,6 @@ public class ObjectSensitivePTA {
     Map<ContextMethod, Map<Stmt, Set<ContextMethod>>> callGraph = new HashMap<>();
 
     ObjectSensitivePTA(int k) {
-        // if (k < 0 || k > 3) throw new IllegalArgumentException("k must be 0-3");
         this.k = k;
     }
 
@@ -556,77 +549,3 @@ public class ObjectSensitivePTA {
         return new LinkedHashSet<>(reachable.keySet());
     }
 }
-
-/*
- * 
- * ✅ 5A. Context-sensitive targets
- * public Set<ContextMethod> getTargets(ContextMethod cm, Stmt site) {
- * return callGraph
- * .getOrDefault(cm, Collections.emptyMap())
- * .getOrDefault(site, Collections.emptySet());
- * }
- * ✅ 5B. Context-insensitive targets
- * public Set<SootMethod> getTargets(SootMethod method, Stmt site) {
- * Set<SootMethod> result = new HashSet<>();
- * 
- * for (Map.Entry<ContextMethod, Map<Stmt, Set<ContextMethod>>> e :
- * callGraph.entrySet()) {
- * if (!e.getKey().method.equals(method))
- * continue;
- * 
- * Set<ContextMethod> cms = e.getValue().get(site);
- * if (cms != null) {
- * for (ContextMethod c : cms)
- * result.add(c.method);
- * }
- * }
- * 
- * return result;
- * }
- * ✅ 5C. Monomorphism check
- * public boolean isMonomorphic(ContextMethod cm, Stmt site) {
- * Set<ContextMethod> targets = getTargets(cm, site);
- * return targets.size() == 1;
- * }
- * 🚀 6. How YOU Use It (Cloning + Inlining)
- * 
- * Now your pipeline becomes:
- * 
- * Step 1: iterate all context methods
- * for (ContextMethod cm : reachable.keySet()) {
- * Body body = cm.method.retrieveActiveBody();
- * Step 2: inspect call sites
- * for (Unit u : body.getUnits()) {
- * Stmt stmt = (Stmt) u;
- * 
- * if (!stmt.containsInvokeExpr()) continue;
- * Step 3: query PTA
- * Set<ContextMethod> targets = getTargets(cm, stmt);
- * Step 4: context-sensitive monomorphisation
- * if (targets.size() == 1) {
- * ContextMethod target = targets.iterator().next();
- * 
- * // 🔥 THIS is your cloning point
- * }
- * 🧬 7. Where Cloning Hooks In
- * 
- * Now you can build:
- * 
- * Map<ContextMethod, SootMethod> cloneMap = new HashMap<>();
- * 
- * Then:
- * 
- * SootMethod cloned = cloneMap.computeIfAbsent(target, t -> cloneMethod(t));
- * 
- * And rewrite:
- * 
- * stmt.getInvokeExpr().setMethodRef(cloned.makeRef());
- * ⚠️ 8. One Important Subtlety (Your Code Specific)
- * 
- * Your ContextMethod:
- * 
- * this.context = Collections.unmodifiableList(...)
- * 
- * ✅ GOOD
- * 
- */
