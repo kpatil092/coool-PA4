@@ -1,9 +1,10 @@
 import soot.*;
 import soot.jimple.*;
-
 import java.util.*;
 
 public class ObjectSensitivePTA {
+
+    // like, a->obj1, a->onj2
     class PTAVar {
         String localName;
         SootMethod method;
@@ -61,7 +62,7 @@ public class ObjectSensitivePTA {
 
     // ---------------------
 
-    final AllocObject NULL_OBJ = new AllocObject("<<null>>", null, null);
+    final AllocObject NULL_OBJ = new AllocObject("<null_pointer>", null, null);
     int k;
 
     Map<ContextMethod, ContextMethod> reachable = new HashMap<>();
@@ -71,6 +72,10 @@ public class ObjectSensitivePTA {
     Map<String, AllocObject> allocCache = new HashMap<>();
 
     Map<ContextMethod, Map<Stmt, Set<ContextMethod>>> callGraph = new HashMap<>();
+
+    Map<SootField, Set<AllocObject>> staticFields = new HashMap<>();
+
+    // Work: TO add onWorkList set, to avoid contains check, t
 
     ObjectSensitivePTA(int k) {
         this.k = k;
@@ -82,7 +87,7 @@ public class ObjectSensitivePTA {
         for (SootMethod m : entryPoints) {
             if (m.isConcrete()) {
                 ContextMethod cm = getOrCreateCM(m, Collections.emptyList());
-                seedEntryPoint(cm);
+                addEntryParams(cm);
             }
         }
 
@@ -92,11 +97,9 @@ public class ObjectSensitivePTA {
         }
     }
 
-    // ------------------------------------------------------------------ //
-    // Method analysis //
-    // ------------------------------------------------------------------ //
+    ////////////
 
-    private void analyzeMethod(ContextMethod cm) {
+    void analyzeMethod(ContextMethod cm) {
         if (cm.method.getDeclaringClass().isJavaLibraryClass()) {
             return;
         }
@@ -107,8 +110,9 @@ public class ObjectSensitivePTA {
         for (Unit u : body.getUnits()) {
             Stmt stmt = (Stmt) u;
             if (stmt instanceof AssignStmt) {
-                if (processAssign((AssignStmt) stmt, cm)) {
-                    enqueue(cm);
+                if (processAssign((AssignStmt) stmt, cm) && !worklist.contains(cm)) {
+                    worklist.add(cm);
+                    // enqueue(cm);
                 }
             } else if (stmt instanceof InvokeStmt) {
                 processInvoke(stmt, ((InvokeStmt) stmt).getInvokeExpr(), cm, null);
@@ -118,78 +122,64 @@ public class ObjectSensitivePTA {
         }
     }
 
-    // ------------------------------------------------------------------ //
-    // Statement handlers //
-    // ------------------------------------------------------------------ //
+    // ------------------------------------------------------------------
 
-    /** Returns true if any points-to set grew (so the caller can re-enqueue). */
-    private boolean processAssign(AssignStmt stmt, ContextMethod cm) {
+    boolean processAssign(AssignStmt stmt, ContextMethod cm) {
         boolean changed = false;
         boolean heapChanged = false;
         Value lhs = stmt.getLeftOp();
         Value rhs = stmt.getRightOp();
 
-        // ---- LHS is a local variable ---------------------------------- //
         if (lhs instanceof Local) {
-            PTAVar lhsVar = varFor((Local) lhs, cm);
+            PTAVar lhsVar = varFor(((Local) lhs).getName(), cm);
 
-            if (rhs instanceof NewExpr) {
-                // x = new T()
+            if (rhs instanceof NewExpr) { // x = new T()
                 SootClass allocClass = ((RefType) ((NewExpr) rhs).getBaseType()).getSootClass();
                 AllocObject obj = allocFor(stmt.toString(), allocClass, cm);
                 changed |= lhsVar.pointsTo.add(obj);
-
             } else if (rhs instanceof Local) {
                 // x = y
-                PTAVar rhsVar = varFor((Local) rhs, cm);
+                PTAVar rhsVar = varFor(((Local) rhs).getName(), cm);
                 changed |= lhsVar.pointsTo.addAll(rhsVar.pointsTo);
-
-            } else if (rhs instanceof CastExpr) {
-                // x = (T) y
-                Value op = ((CastExpr) rhs).getOp();
-                if (op instanceof Local) {
-                    changed |= lhsVar.pointsTo.addAll(varFor((Local) op, cm).pointsTo);
-                }
-
             } else if (rhs instanceof InstanceFieldRef) {
                 // x = b.f
                 InstanceFieldRef ifr = (InstanceFieldRef) rhs;
                 SootField field = ifr.getField();
                 if (ifr.getBase() instanceof Local) {
-                    PTAVar baseVar = varFor((Local) ifr.getBase(), cm);
+                    PTAVar baseVar = varFor(((Local) ifr.getBase()).getName(), cm);
                     for (AllocObject obj : new ArrayList<>(baseVar.pointsTo)) {
                         if (obj == NULL_OBJ)
                             continue;
                         changed |= lhsVar.pointsTo.addAll(obj.getField(field));
                     }
                 }
-
             } else if (rhs instanceof StaticFieldRef) {
-                // x = ClassName.f – handled via global static field map
                 SootField field = ((StaticFieldRef) rhs).getField();
-                changed |= lhsVar.pointsTo.addAll(getStaticField(field));
-
+                // changed |= lhsVar.pointsTo.addAll(getStaticField(field));
+                changed |= lhsVar.pointsTo.addAll(staticFields.computeIfAbsent(field, __ -> new HashSet<>()));
             } else if (rhs instanceof InvokeExpr) {
-                // x = foo(...)
                 changed |= processInvoke(stmt, (InvokeExpr) rhs, cm, lhsVar);
-
             } else if (rhs instanceof NullConstant) {
                 changed |= lhsVar.pointsTo.add(NULL_OBJ);
-
             } else if (rhs instanceof NewArrayExpr || rhs instanceof NewMultiArrayExpr) {
-                // Treat array allocation like a regular object.
                 AllocObject obj = allocFor(stmt.toString(), null, cm);
                 changed |= lhsVar.pointsTo.add(obj);
             }
 
-            // ---- LHS is an instance field --------------------------------- //
+            else if (rhs instanceof CastExpr) {
+                // x = (T) y
+                Value op = ((CastExpr) rhs).getOp();
+                if (op instanceof Local) {
+                    changed |= lhsVar.pointsTo.addAll(varFor(((Local) op).getName(), cm).pointsTo);
+                }
+            }
         } else if (lhs instanceof InstanceFieldRef) {
             // b.f = rhs
             InstanceFieldRef ifr = (InstanceFieldRef) lhs;
             SootField field = ifr.getField();
             if (ifr.getBase() instanceof Local && rhs instanceof Local) {
-                PTAVar baseVar = varFor((Local) ifr.getBase(), cm);
-                PTAVar rhsVar = varFor((Local) rhs, cm);
+                PTAVar baseVar = varFor(((Local) ifr.getBase()).getName(), cm);
+                PTAVar rhsVar = varFor(((Local) rhs).getName(), cm);
                 for (AllocObject obj : new ArrayList<>(baseVar.pointsTo)) {
                     if (obj == NULL_OBJ)
                         continue;
@@ -199,26 +189,28 @@ public class ObjectSensitivePTA {
                 }
             }
 
-            // ---- LHS is a static field ------------------------------------ //
         } else if (lhs instanceof StaticFieldRef) {
-            // ClassName.f = rhs
             SootField field = ((StaticFieldRef) lhs).getField();
             if (rhs instanceof Local) {
-                PTAVar rhsVar = varFor((Local) rhs, cm);
-                boolean fieldChanged = getStaticField(field).addAll(rhsVar.pointsTo);
+                PTAVar rhsVar = varFor(((Local) rhs).getName(), cm);
+                boolean fieldChanged = staticFields.computeIfAbsent(field, __ -> new HashSet<>())
+                        .addAll(rhsVar.pointsTo);
                 changed |= fieldChanged;
                 heapChanged |= fieldChanged;
             }
         }
 
-        if (heapChanged)
-            requeueAll();
+        if (heapChanged) {
+            for (ContextMethod ctxMtd : reachable.keySet()) {
+                if (!worklist.contains(ctxMtd))
+                    worklist.add(ctxMtd);
+            }
+        }
 
         return changed;
     }
 
-    /** Dispatch an invoke expression; returns true if any set grew. */
-    private boolean processInvoke(Stmt stmt, InvokeExpr ie, ContextMethod cm, PTAVar retDst) {
+    boolean processInvoke(Stmt stmt, InvokeExpr ie, ContextMethod cm, PTAVar retDst) {
         if (ie instanceof StaticInvokeExpr)
             return processStaticCall(stmt, (StaticInvokeExpr) ie, cm, retDst);
         if (ie instanceof SpecialInvokeExpr)
@@ -228,33 +220,41 @@ public class ObjectSensitivePTA {
         return false;
     }
 
-    /** Propagate return value to all registered destinations. */
-    private void processReturn(ReturnStmt stmt, ContextMethod cm) {
+    void processReturn(ReturnStmt stmt, ContextMethod cm) {
         Value retVal = stmt.getOp();
         if (!(retVal instanceof Local) || cm.returnDests.isEmpty())
             return;
-        PTAVar retVar = varFor((Local) retVal, cm);
+        PTAVar retVar = varFor(((Local) retVal).getName(), cm);
         for (PTAVar dst : cm.returnDests) {
             if (dst.pointsTo.addAll(retVar.pointsTo)) {
-                // The destination variable's owning context-method must be re-run.
-                // We conservatively re-enqueue all reachable methods that own dst.
-                // (A finer approach: maintain a reverse map variable->CM.)
-                requeueAll();
+                // requeueAll();
+                for (ContextMethod ctxMtd : reachable.keySet()) {
+                    if (!worklist.contains(ctxMtd))
+                        worklist.add(ctxMtd);
+                }
             }
         }
     }
 
-    // ------------------------------------------------------------------ //
-    // Call handlers //
-    // ------------------------------------------------------------------ //
+    boolean processStaticCall(Stmt stmt, StaticInvokeExpr se, ContextMethod cm, PTAVar retDst) {
+        // SootMethod callee = resolve(se.getMethodRef());
+        SootMethod callee = null;
+        try {
+            callee = se.getMethodRef().resolve();
+        } catch (Exception e) {
+        }
 
-    private boolean processStaticCall(Stmt stmt, StaticInvokeExpr se, ContextMethod cm, PTAVar retDst) {
-        SootMethod callee = resolve(se.getMethodRef());
         if (callee == null)
             return false;
 
-        // Static calls inherit the caller's context unchanged (no new receiver).
-        List<AllocObject> newCtx = trimContext(cm.context);
+        if (!callee.isConcrete())
+            return false;
+
+        // List<AllocObject> newCtx = trimContext(cm.context);
+        List<AllocObject> newCtx = new ArrayList<>(cm.context);
+        if (newCtx.size() > k)
+            newCtx = new ArrayList<>(newCtx.subList(0, k));
+
         ContextMethod calleeContext = getOrCreateCM(callee, newCtx);
 
         recordCall(cm, stmt, calleeContext);
@@ -262,79 +262,115 @@ public class ObjectSensitivePTA {
         if (retDst != null)
             changed |= calleeContext.returnDests.add(retDst);
         changed |= pairArgs(se.getArgs(), cm, callee, calleeContext);
-        if (changed)
-            enqueue(calleeContext);
+        if (changed && !worklist.contains(calleeContext))
+            worklist.add(calleeContext);
         return changed;
     }
 
-    private boolean processSpecialCall(Stmt stmt, SpecialInvokeExpr se, ContextMethod cm, PTAVar retDst) {
-        SootMethod callee = resolve(se.getMethodRef());
+    boolean processSpecialCall(Stmt stmt, SpecialInvokeExpr se, ContextMethod cm, PTAVar retDst) {
+        SootMethod callee = null;
+
+        try {
+            callee = se.getMethodRef().resolve();
+        } catch (Exception e) {
+        }
+
         if (callee == null || !(se.getBase() instanceof Local))
             return false;
 
-        PTAVar baseVar = varFor((Local) se.getBase(), cm);
+        if (!callee.isConcrete())
+            return false;
+
+        PTAVar baseVar = varFor(((Local) se.getBase()).getName(), cm);
         boolean changed = false;
 
         for (AllocObject receiver : new ArrayList<>(baseVar.pointsTo)) {
             if (receiver == NULL_OBJ)
                 continue;
 
-            List<AllocObject> newCtx = pushContext(cm.context, receiver);
+            List<AllocObject> newCtx = new ArrayList<>(cm.context);
+            newCtx.add(0, receiver);
+            if (newCtx.size() > k)
+                newCtx = newCtx.subList(0, k);
+
+
             ContextMethod calleeContext = getOrCreateCM(callee, newCtx);
             recordCall(cm, stmt, calleeContext);
 
-            // Bind 'this' in callee
-            changed |= varForThis(calleeContext).pointsTo.add(receiver);
+            // changed |= varForThis(calleeContext).pointsTo.add(receiver);
+
+            PTAVar thisVar = null;
+            if (!calleeContext.method.isConcrete() || !calleeContext.method.hasActiveBody()
+                    || calleeContext.method.isStatic())
+                thisVar = varFor("@this", calleeContext);
+            else
+                thisVar = varFor(calleeContext.method.getActiveBody().getThisLocal().getName(), calleeContext);
+
+            changed |= thisVar.pointsTo.add(receiver);
+
             if (retDst != null)
                 changed |= calleeContext.returnDests.add(retDst);
             changed |= pairArgs(se.getArgs(), cm, callee, calleeContext);
-            if (changed)
-                enqueue(calleeContext);
+            if (changed && !worklist.contains(calleeContext))
+                worklist.add(calleeContext);
+            // enqueue(calleeContext);
         }
         return changed;
     }
 
-    private boolean processVirtualCall(Stmt stmt, InstanceInvokeExpr ie, ContextMethod cm, PTAVar retDst) {
+    boolean processVirtualCall(Stmt stmt, InstanceInvokeExpr ie, ContextMethod cm, PTAVar retDst) {
         if (!(ie.getBase() instanceof Local))
             return false;
 
-        PTAVar baseVar = varFor((Local) ie.getBase(), cm);
+        PTAVar baseVar = varFor(((Local) ie.getBase()).getName(), cm);
         boolean changed = false;
 
         for (AllocObject receiver : new ArrayList<>(baseVar.pointsTo)) {
             if (receiver == NULL_OBJ || receiver.allocType == null)
                 continue;
 
-            SootMethod callee = resolveVirtual(receiver.allocType, ie.getMethodRef());
+            SootMethod callee = null;
+            // resolveVirtual(receiver.allocType, ie.getMethodRef());
+            try {
+                callee = Scene.v().getActiveHierarchy()
+                        .resolveConcreteDispatch(receiver.allocType, ie.getMethodRef().resolve());
+            } catch (Exception e) {
+            }
+
             if (callee == null)
                 continue;
 
-            List<AllocObject> newCtx = pushContext(cm.context, receiver);
+            List<AllocObject> newCtx = new ArrayList<>(cm.context);
+            newCtx.add(0, receiver);
+            if (newCtx.size() > k)
+                newCtx = newCtx.subList(0, k);
+            //
+
             ContextMethod calleeContext = getOrCreateCM(callee, newCtx);
             recordCall(cm, stmt, calleeContext);
 
-            // Bind 'this' in callee
-            changed |= varForThis(calleeContext).pointsTo.add(receiver);
+            // changed |= varForThis(calleeContext).pointsTo.add(receiver);
+
+            PTAVar thisVar = null;
+            if (!calleeContext.method.isConcrete() || !calleeContext.method.hasActiveBody()
+                    || calleeContext.method.isStatic())
+                thisVar = varFor("@this", calleeContext);
+            else
+                thisVar = varFor(calleeContext.method.getActiveBody().getThisLocal().getName(), calleeContext);
+
+            changed |= thisVar.pointsTo.add(receiver);
+
             if (retDst != null)
                 changed |= calleeContext.returnDests.add(retDst);
             changed |= pairArgs(ie.getArgs(), cm, callee, calleeContext);
-            if (changed)
-                enqueue(calleeContext);
+            if (changed && !worklist.contains(calleeContext))
+                worklist.add(calleeContext);
+            // enqueue(calleeContext);
         }
         return changed;
     }
 
-    // ------------------------------------------------------------------ //
-    // Helpers //
-    // ------------------------------------------------------------------ //
-
-    /**
-     * Pair actual arguments in the caller to formal parameters in the callee.
-     * Parameter locals are named by their position: "@parameter0", "@parameter1",
-     * ...
-     * (Jimple convention). We key on that so analyzeMethod finds them correctly.
-     */
-    private boolean pairArgs(List<Value> args, ContextMethod callerCM,
+    boolean pairArgs(List<Value> args, ContextMethod callerCM,
             SootMethod callee, ContextMethod calleeCM) {
         boolean changed = false;
         Body calleeBody = null;
@@ -345,21 +381,18 @@ public class ObjectSensitivePTA {
             Value arg = args.get(i);
             if (!(arg instanceof Local))
                 continue;
-            PTAVar argVar = varFor((Local) arg, callerCM);
-            // Fetch the callee's formal parameter local from its body if available.
+            PTAVar argVar = varFor(((Local) arg).getName(), callerCM);
             String paramLocalName = (calleeBody != null && i < callee.getParameterCount())
                     ? calleeBody.getParameterLocal(i).getName()
                     : ("@parameter" + i);
-            PTAVar paramVar = getOrCreateVar(paramLocalName, calleeCM);
+            // PTAVar paramVar = getOrCreateVar(paramLocalName, calleeCM);
+            PTAVar paramVar = varFor(paramLocalName, calleeCM);
             changed |= paramVar.pointsTo.addAll(argVar.pointsTo);
         }
         return changed;
     }
 
-    /**
-     * Seed an entry-point method with fresh abstract objects for its parameters.
-     */
-    private void seedEntryPoint(ContextMethod cm) {
+    void addEntryParams(ContextMethod cm) {
         if (!cm.method.isConcrete() || !cm.method.hasActiveBody()) {
             return;
         }
@@ -367,41 +400,21 @@ public class ObjectSensitivePTA {
         if (!cm.method.isStatic()) {
             Local thisLocal = body.getThisLocal();
             SootClass cls = cm.method.getDeclaringClass();
-            AllocObject thisObj = allocFor("<<entry-this>>", cls, cm);
-            varFor(thisLocal, cm).pointsTo.add(thisObj);
+            AllocObject thisObj = allocFor("<THIS_ENTRY>", cls, cm);
+            varFor(thisLocal.getName(), cm).pointsTo.add(thisObj);
         }
         for (int i = 0; i < cm.method.getParameterCount(); i++) {
             Type pType = cm.method.getParameterType(i);
             if (!(pType instanceof RefType))
-                continue; // skip primitives
+                continue;
             Local paramLocal = body.getParameterLocal(i);
             SootClass cls = ((RefType) pType).getSootClass();
-            AllocObject paramObj = allocFor("<<entry-param" + i + ">>", cls, cm);
-            varFor(paramLocal, cm).pointsTo.add(paramObj);
+            AllocObject paramObj = allocFor("<PARAM_ENTRY_" + i + ">", cls, cm);
+            varFor(paramLocal.getName(), cm).pointsTo.add(paramObj);
         }
     }
 
-    /** Push receiver onto the front of the context, trimming to length k. */
-    private List<AllocObject> pushContext(List<AllocObject> ctx, AllocObject receiver) {
-        List<AllocObject> next = new ArrayList<>();
-        next.add(receiver);
-        next.addAll(ctx);
-        return trimContext(next);
-    }
-
-    /** Trim a context list to at most k elements (keep the most-recent). */
-    private List<AllocObject> trimContext(List<AllocObject> ctx) {
-        if (ctx.size() <= k)
-            return ctx;
-        return new ArrayList<>(ctx.subList(0, k));
-    }
-
-    // ------------------------------------------------------------------ //
-    // Cache management //
-    // ------------------------------------------------------------------ //
-
-    /** Get or create the canonical ContextMethod, and enqueue it if new. */
-    private ContextMethod getOrCreateCM(SootMethod method, List<AllocObject> ctx) {
+    ContextMethod getOrCreateCM(SootMethod method, List<AllocObject> ctx) {
         ContextMethod key = new ContextMethod(method, ctx);
         ContextMethod existing = reachable.get(key);
         if (existing != null)
@@ -411,19 +424,10 @@ public class ObjectSensitivePTA {
         return key;
     }
 
-    private PTAVar varFor(Local local, ContextMethod cm) {
-        return getOrCreateVar(local.getName(), cm);
-    }
-
-    private PTAVar varForThis(ContextMethod cm) {
-        if (!cm.method.isConcrete() || !cm.method.hasActiveBody() || cm.method.isStatic()) {
-            return getOrCreateVar("@this", cm);
-        }
-        return varFor(cm.method.getActiveBody().getThisLocal(), cm);
-    }
-
-    private PTAVar getOrCreateVar(String localName, ContextMethod cm) {
-        String key = varKey(localName, cm);
+    PTAVar varFor(String localName, ContextMethod cm) {
+        // return getOrCreateVar(local.getName(), cm);
+        // String key = varKey(localName, cm);
+        String key = localName + "|" + ctxKey(cm.context) + "|" + cm.method.getSignature();
         PTAVar v = varCache.get(key);
         if (v == null) {
             v = new PTAVar(localName, cm.method);
@@ -432,7 +436,7 @@ public class ObjectSensitivePTA {
         return v;
     }
 
-    private AllocObject allocFor(String site, SootClass type, ContextMethod cm) {
+    AllocObject allocFor(String site, SootClass type, ContextMethod cm) {
         String key = site + "|" + ctxKey(cm.context) + "|" + cm.method.getSignature();
         AllocObject obj = allocCache.get(key);
         if (obj == null) {
@@ -442,25 +446,7 @@ public class ObjectSensitivePTA {
         return obj;
     }
 
-    // ------------------------------------------------------------------ //
-    // Static field global store //
-    // ------------------------------------------------------------------ //
-
-    private Map<SootField, Set<AllocObject>> staticFields = new HashMap<>();
-
-    private Set<AllocObject> getStaticField(SootField f) {
-        return staticFields.computeIfAbsent(f, __ -> new HashSet<>());
-    }
-
-    // ------------------------------------------------------------------ //
-    // Key builders //
-    // ------------------------------------------------------------------ //
-
-    private String varKey(String localName, ContextMethod cm) {
-        return localName + "|" + ctxKey(cm.context) + "|" + cm.method.getSignature();
-    }
-
-    private String ctxKey(List<AllocObject> ctx) {
+    String ctxKey(List<AllocObject> ctx) {
         if (ctx.isEmpty())
             return "";
         StringBuilder sb = new StringBuilder();
@@ -469,58 +455,14 @@ public class ObjectSensitivePTA {
         return sb.toString();
     }
 
-    // ------------------------------------------------------------------ //
-    // Worklist helpers //
-    // ------------------------------------------------------------------ //
 
-    private void enqueue(ContextMethod cm) {
-        if (!worklist.contains(cm))
-            worklist.add(cm);
-    }
-
-    /**
-     * Conservative re-enqueue: when a return destination grows we don't know
-     * which ContextMethod owns it cheaply, so we re-add all reachable ones.
-     * For k<=3 and typical programs this is fine; replace with a reverse map
-     * for very large programs.
-     */
-    private void requeueAll() {
-        for (ContextMethod cm : reachable.keySet()) {
-            if (!worklist.contains(cm))
-                worklist.add(cm);
-        }
-    }
-
-    // ------------------------------------------------------------------ //
-    // Virtual dispatch //
-    // ------------------------------------------------------------------ //
-
-    private SootMethod resolve(SootMethodRef ref) {
-        try {
-            SootMethod m = ref.resolve();
-            return (m != null && m.isConcrete()) ? m : null;
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    private SootMethod resolveVirtual(SootClass cls, SootMethodRef ref) {
-        try {
-            return Scene.v().getActiveHierarchy()
-                    .resolveConcreteDispatch(cls, ref.resolve());
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    private void recordCall(ContextMethod caller, Stmt site, ContextMethod callee) {
+    void recordCall(ContextMethod caller, Stmt site, ContextMethod callee) {
         callGraph
                 .computeIfAbsent(caller, k -> new HashMap<>())
                 .computeIfAbsent(site, k -> new HashSet<>())
                 .add(callee);
     }
 
-    // method for printing the call graph
     public void printCallGraph() {
         for (Map.Entry<ContextMethod, Map<Stmt, Set<ContextMethod>>> e : callGraph.entrySet()) {
             ContextMethod caller = e.getKey();
